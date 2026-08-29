@@ -101,7 +101,7 @@ jlink() {  # jlink <script-file> -> stdout, also tee'd to $WORK/last.log
 readval() { grep -iE "^0*${1} = " "$WORK/last.log" | tail -1 | awk '{print $3}' | tr 'a-f' 'A-F'; }
 
 hdr() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-die() { printf '\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit "${2:-3}"; }
+die() { printf '\033[31mFAIL: %s\033[0m\n' "$1" >&2; exit "${2:-3}"; }
 
 # ---------------------------------------------------------------- preflight
 hdr "1/4  Preflight"

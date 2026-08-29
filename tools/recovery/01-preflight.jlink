@@ -1,0 +1,31 @@
+// STEP 1/3 - READ ONLY. Confirms the part is in the state the fix assumes.
+//
+// Expected on a poisoned part:
+//   0x0100A1C0 BPS       = 00000000   poisoned, permanent, stays this way
+//   0x0100A1E0 PBPS      = 00000000   poisoned, permanent, stays this way
+//   0x0100A240 BPS_SEC   = FFFFFFFF   REQUIRED - this is the escape route
+//   0x0100A260 PBPS_SEC  = FFFFFFFF   REQUIRED - this is the escape route
+//   0x0100A2C0 BPS_SEL   = FFFFFFFF   currently selecting the poisoned pair
+//   0x400E002C DLMMON    = 00000001   CM -> debug level DBG2, required
+//   0x407FE080 FSTATR    = 00008000   FRDY set, no errors
+//   0x407FE010 FASTAT    = 00         no command lock
+//
+// ABORT if BPS_SEC or PBPS_SEC is not FFFFFFFF: the secure pair is also
+// poisoned and this recovery cannot work. Replace the IC.
+// ABORT if DLMMON is not 1 (CM) or 2 (SSD): DBG2 is required to program the
+// secure region of option-setting memory (H/W manual Table 6.1, Table 46.8).
+device R7FA4M2AB
+si SWD
+speed 1000
+connect
+r
+h
+mem32 0x0100A1C0 1
+mem32 0x0100A1E0 1
+mem32 0x0100A240 1
+mem32 0x0100A260 1
+mem32 0x0100A2C0 1
+mem32 0x400E002C 1
+mem32 0x407FE080 1
+mem8 0x407FE010 1
+exit

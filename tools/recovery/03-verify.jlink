@@ -1,0 +1,23 @@
+// STEP 3/3 - proves the unlock took.
+//
+// The reset is MANDATORY, not cosmetic. Table 44.18 gives BPS_SEL's "Timing
+// when the Setting is Enabled" as "At a reset", and section 6.3.4 spells out
+// that BPS_SEC/PBPS_SEC are not applied until the MCU is reset even once
+// BPS_SEL has been programmed to 0.
+//
+// Success = block 0 erases. This is the exact Block Erase that returned
+// FSTATR 0x0080C000 / FASTAT 0x10 and J-Link "Erase returned with error
+// code -5" before the fix.
+device R7FA4M2AB
+si SWD
+speed 1000
+connect
+r
+Sleep 200
+h
+mem32 0x0100A2C0 1           // expect FFFFC000 - if FFFFFFFF the fix was lost
+erase 0x00000000 0x00001FFF  // block 0, 8 KB. RANGED erase - never bare `erase`
+mem32 0x00000000 2           // expect FFFFFFFF FFFFFFFF
+mem32 0x407FE080 1
+mem8 0x407FE010 1
+exit

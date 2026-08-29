@@ -78,3 +78,23 @@ The probe firmware has been tested debugging a variety of RA Family MCUs using :
 * Keil MDK 5.38a in conjunction with the Renesas RA CMSIS Device Family Pack (DFP) providing device support including flash loaders.
 * IAR EWARM 9.32.x (using IAR flash loaders).
 * PyOCD 0.34.1 (using flash loaders from the RA DFP).
+
+## Recovering a block-protected board
+
+> **Never program a flat `objcopy -O binary` image at address 0.** The FSP ELF
+> spans `0x0`–`0x0100_A2CC`, so a plain `objcopy -O binary` emits a 16 MB file
+> gap-filled with `0x00` — including at BPS (`0x0100_A1C0`) and PBPS
+> (`0x0100_A1E0`). Programming it permanently block-protects code flash. A
+> correct code-flash-only `.bin` is ~54 KB; the `.srec` and `.elf` are safe.
+
+If a board's code flash refuses to erase or program (`Failed to erase sectors`,
+`error code -5`, `FSTATR = 0x0080C000`), it can be recovered without replacing
+the IC:
+
+```sh
+cd tools/recovery
+./recover.sh --sn <jlink-serial> --bin ../../ra4m2/Debug/CMSIS_DAP_RA4M2.bin
+```
+
+See [tools/recovery/README.md](tools/recovery/README.md) for the mechanism and
+the manual references.

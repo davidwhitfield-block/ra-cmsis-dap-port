@@ -1,0 +1,80 @@
+// STEP 2/3 - THE FIX. Irreversible, but strictly in your favour.
+//
+// Issues a Configuration Set command writing BPS_SEL (0x0100A2C0) = 0xFFFFC000.
+// That clears bits 0-13, i.e. blocks 0-13 of a 256 KB R7FA4M2AB.
+//   256 KB (R7FA4M2AB, blocks 0-13) -> 0xFFFFC000
+//   384 KB              blocks 0-17 -> 0xFFFC0000
+//   512 KB (R7FA4M2AD, blocks 0-21) -> 0xFFC00000
+// Reserved bits must stay 1 (H/W manual section 6.2.4).
+//
+// WHY IT WORKS - R01UH0892EJ0150:
+//   6.2.5     One register, BPS_SEL, selects the APPLIED pair for BOTH BPS and
+//             PBPS. Setting a bit to 0 makes BPS_SEC/PBPS_SEC apply instead.
+//             Those are still FFFFFFFF, so Table 6.2 row 1 => "programming and
+//             erasure to the corresponding block is valid".
+//   44.18     Lists BPS_SEL as "Writable/Writable" with NO restriction note,
+//             while BPS/PBPS/BPS_SEC/PBPS_SEC each carry a "cannot be restored
+//             to 1" note. PBPS invalidates writes to BPS and BPS_SEC, never to
+//             BPS_SEL.
+//   44.22     The write/clear freeze covers BPS[n] and PBPS[n] only.
+//   44.33     Sequencer judges secure region from FSADDR; 0x0100A200-0x0100A2FF
+//             is secure, so DBG2 is required (Table 6.1). CM and SSD give DBG2.
+//
+// The poisoned BPS/PBPS stay 00000000 forever. They are simply never consulted
+// again. FBPROT0/FBPROT1 cancellation does NOT work here and never will -
+// 44.11.1.3 locks the command "regardless of the FBPROT0 and FBPROT1 settings".
+device R7FA4M2AB
+si SWD
+speed 1000
+connect
+r
+h
+
+// --- 1. FMEPROT: key 0xD9, CEPROT=0. Reset value protects FENTRYR.FENTRYC,
+//        so without this you cannot enter code-flash P/E mode at all.
+w2 0x407FE044, 0xD900
+
+// --- 2. FWEPROR: FLWE=01b, the ONLY value that permits Configuration Set.
+//        NOTE THE BASE: FWEPROR is on SYSC 0x4001_E000, NOT the FACI base.
+//        Reset value is 10b = prohibit. Writing 0x407FE416 instead is a silent
+//        no-op that surfaces later as FLWEERR (FSTATR bit 6, = 0x00008040).
+w1 0x4001E416, 0x01
+mem8 0x4001E416 1            // expect 01
+
+// --- 3. FENTRYR: key 0xAA, FENTRYC=1 -> code-flash P/E mode.
+//        0xAA80 is DATA flash. 0xAA81 deliberately raises ILGLERR.
+w2 0x407FE084, 0xAA01
+mem16 0x407FE084 1           // expect 0001
+mem32 0x407FE080 1           // FSTATR must be 00008000 before issuing a command
+
+// --- 4. Configuration Set. Table 44.14: 11 write accesses total,
+//        0x40, N=0x08, WD1..WD8, 0xD0.
+//        Command/N/0xD0 cycles are BYTE writes; only WD1..WD8 are 16-bit.
+//        A 16-bit first cycle gives ILGCOMERR+ILGLERR (FSTATR = 0x0080C000) -
+//        Table 44.21 "An undefined size is specified in the first cycle of the
+//        command. (not byte-write)".
+w1 0x407E0000, 0x50          // Status Clear, drops any stale command lock
+w4 0x407FE030, 0x0100A2C0    // FSADDR = BPS_SEL (also selects the secure region)
+w1 0x407E0000, 0x40          // opcode                (byte)
+w1 0x407E0000, 0x08          // N = 8 half-words      (byte)
+w2 0x407E0000, 0xC000        // WD1 BPS_SEL[15:0]
+w2 0x407E0000, 0xFFFF        // WD2 BPS_SEL[31:16]
+w2 0x407E0000, 0xFFFF        // WD3  ) remainder of the 16-byte config unit,
+w2 0x407E0000, 0xFFFF        // WD4  ) reserved, must be written as 1s
+w2 0x407E0000, 0xFFFF        // WD5
+w2 0x407E0000, 0xFFFF        // WD6
+w2 0x407E0000, 0xFFFF        // WD7
+w2 0x407E0000, 0xFFFF        // WD8
+w1 0x407E0000, 0xD0          // execute                (byte)
+Sleep 200
+
+// --- 5. Result. Success = FSTATR 00008000 and FASTAT 00.
+//        0x0080C000 / FASTAT 10 -> malformed command (check byte writes).
+//        0x00008040 / FASTAT 10 -> FLWEERR (check FWEPROR base address).
+mem32 0x407FE080 1
+mem8 0x407FE010 1
+
+// --- 6. Back to read mode and confirm.
+w2 0x407FE084, 0xAA00
+mem32 0x0100A2C0 1           // expect FFFFC000
+exit

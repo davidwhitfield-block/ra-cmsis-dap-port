@@ -79,6 +79,16 @@ The probe firmware has been tested debugging a variety of RA Family MCUs using :
 * IAR EWARM 9.32.x (using IAR flash loaders).
 * PyOCD 0.34.1 (using flash loaders from the RA DFP).
 
+## Building and flashing
+
+```sh
+scripts/flash.sh --sn <jlink-serial>
+```
+
+Builds if needed, unlocks the board if its block protection was poisoned, then
+programs it. Safe to run repeatedly and on any board state — blank, healthy, or
+locked. See [scripts/README.md](scripts/README.md).
+
 ## Recovering a block-protected board
 
 > **Never program a flat `objcopy -O binary` image at address 0.** The FSP ELF

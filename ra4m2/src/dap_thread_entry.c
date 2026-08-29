@@ -961,16 +961,40 @@ static fsp_err_t process_usb_events(usb_event_info_t *p_event_info)
     }
 
     case USB_STATUS_DETACH:
-    case USB_STATUS_SUSPEND:
     {
-        APP_PRINT("\nUSB STATUS : USB_STATUS_DETACH & USB_STATUS_SUSPEND\r\n");
-        /* Reset the usb attached flag as indicating usb is removed.*/
+        APP_PRINT("\nUSB STATUS : USB_STATUS_DETACH\r\n");
+        /* VBUS is gone: the device really is unplugged and has lost its
+         * address, its configuration and its pipes. */
         b_usb_configured = false;
         break;
     }
+
+    case USB_STATUS_SUSPEND:
+    {
+        APP_PRINT("\nUSB STATUS : USB_STATUS_SUSPEND\r\n");
+        /* Deliberately does NOT clear b_usb_configured.
+         *
+         * A suspend is the host idling the bus, not an unplug: the device
+         * keeps its address, its configuration and its pipes across it, and
+         * the host resumes without re-issuing SET_CONFIGURATION. Clearing the
+         * flag here was therefore a one-way door - USB_STATUS_RESUME had
+         * nothing to put it back - and this case used to share its body with
+         * USB_STATUS_DETACH, so it did exactly that.
+         *
+         * The cost was not just cosmetic. Hosts suspend an idle interface
+         * within seconds, so a probe that had enumerated perfectly well would
+         * drop to the "never enumerated" slow blink and stay there for the
+         * rest of the session, and the `if (b_usb_configured)` guards on the
+         * read and write completion paths below would silently discard every
+         * transfer that arrived afterwards. */
+        break;
+    }
+
     case USB_STATUS_RESUME:
     {
         APP_PRINT("\nUSB STATUS : USB_STATUS_RESUME\r\n");
+        /* Nothing to restore, because the suspend no longer tears anything
+         * down. Left explicit so the pair reads as a matched set. */
         break;
     }
     default:

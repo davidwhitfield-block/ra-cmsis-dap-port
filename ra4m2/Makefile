@@ -67,9 +67,15 @@ ELF  = $(BUILD)/$(PROJECT).elf
 # flat binary would be padded out to ~16MB. This matches the "Create flash image"
 # (-O srec) setting in .cproject.
 SREC = $(BUILD)/$(PROJECT).srec
+# Code-flash-only image, for `make flash`. See the comment on the flash target:
+# this deliberately drops every section that lands outside code flash, so nothing
+# can program the option-setting memory at 0x0100_A1xx.
+BIN  = $(BUILD)/$(PROJECT).bin
+NO_CFG_SECTIONS = -R .option_setting -R .option_setting_ns -R .option_setting_s \
+                  -R .data_flash
 
 .PHONY: all clean flash size
-all: $(ELF) $(SREC) size
+all: $(ELF) $(SREC) $(BIN) size
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -88,6 +94,9 @@ $(ELF): $(OBJS) $(MEMREGIONS) script/fsp.ld
 $(SREC): $(ELF)
 	@$(OBJCOPY) -O srec $< $@
 
+$(BIN): $(ELF)
+	@$(OBJCOPY) -O binary $(NO_CFG_SECTIONS) $< $@
+
 size: $(ELF)
 	@$(SIZE) --format=berkeley $(ELF)
 
@@ -99,9 +108,35 @@ JLINK_SEL = $(if $(JLINK_SN),-SelectEmuBySN $(JLINK_SN),)
 
 JLINK_SCRIPT = script/ra4m2_flash.JLinkScript
 
-flash: $(ELF)
-	@printf 'device %s\nsi SWD\nspeed 1000\nconnect\nr\nh\nloadfile %s\nr\ng\nqc\n' \
-	  "$(DEVICE)" "$(ELF)" > $(BUILD)/flash.jlink
+# Programs a code-flash-ONLY .bin. Never generate the flat binary with a plain
+# `objcopy -O binary` - that is what scrapped three boards.
+#
+# This ELF spans 0x0 to 0x0100_A2CC, so `objcopy -O binary` with no -R emits a
+# 16 MB file and fills the gaps with 0x00 (objcopy's default, not 0xFF). The
+# gap at 0x0100_A138-0x0100_A1FF is the non-secure option region, which holds
+# BPS (0x0100_A1C0) and PBPS (0x0100_A1E0) - the block-protect and *permanent*
+# block-protect settings for code flash. So the flat binary carries 0x00000000
+# at both, and `loadbin <it> 0x0` programs them.
+#
+# Per R01UH0892EJ section 6.2.5 / table 6.2, a block whose BPS and PBPS bits are
+# both 0 is "invalid permanently": every Program/Block Erase command-locks the
+# sequencer (FSTATR.ILGCOMERR, FASTAT.CMDLK) regardless of FBPROT0/FBPROT1, PBPS
+# can never be restored to 1, and the boot-mode initialize command refuses to
+# run while any permanently locked block exists. No recovery - not RFP, not a
+# DLM transition, not RMA. The part is scrap.
+#
+# The released CMSIS_DAP_RA4M2.bin (16,818,892 bytes) is byte-identical to a
+# plain `objcopy -O binary` of the released ELF and contains exactly those
+# zeros; D-PCD-0283 tells the factory to `loadbin` it at 0x0. Three of three
+# boards checked came back with BPS = PBPS = 0 and 0x00 padding above the image
+# (erased flash reads 0xFF, so 0x00 proves it was programmed, not blank).
+#
+# For the record, `loadfile` on the .elf and the .srec are both SAFE - neither
+# format carries gap padding, so neither can reach 0x0100_A1C0. Only the flat
+# binary is dangerous. The -R flags below are what make it safe.
+flash: $(BIN)
+	@printf 'device %s\nsi SWD\nspeed 1000\nconnect\nr\nh\nerase\nloadbin %s 0x0\nr\ng\nqc\n' \
+	  "$(DEVICE)" "$(BIN)" > $(BUILD)/flash.jlink
 	JLinkExe -nogui 1 -ExitOnError 1 $(JLINK_SEL) \
 	  -JLinkScriptFile $(JLINK_SCRIPT) -CommanderScript $(BUILD)/flash.jlink
 

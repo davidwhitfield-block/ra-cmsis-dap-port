@@ -22,7 +22,7 @@ FSP_HEADER
 #define PMOD1_MOSI (BSP_IO_PORT_02_PIN_07)
 #define GROVE1_SCL_QWIIC_SCL (BSP_IO_PORT_04_PIN_08)
 #define GROVE1_SDA_QWIIC_SDA (BSP_IO_PORT_04_PIN_09)
-extern const ioport_cfg_t g_bsp_pin_cfg; /* RA4M2 EK */
+extern const ioport_cfg_t g_bsp_pin_cfg; /* X2C_AUTOMATION */
 
 void BSP_PinConfigSecurityInit();
 

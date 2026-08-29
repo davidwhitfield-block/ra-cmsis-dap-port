@@ -6,30 +6,31 @@ const ioport_pin_cfg_t g_bsp_pin_cfg_data[] =
         {
         { .pin = BSP_IO_PORT_01_PIN_00, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
                 | (uint32_t) IOPORT_PERIPHERAL_SCI0_2_4_6_8) },
-          { .pin = BSP_IO_PORT_01_PIN_01, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
-                  | (uint32_t) IOPORT_PERIPHERAL_SCI0_2_4_6_8) },
+          { .pin = BSP_IO_PORT_01_PIN_01, .pin_cfg = ((uint32_t) IOPORT_CFG_PORT_DIRECTION_OUTPUT
+                  | (uint32_t) IOPORT_CFG_PORT_OUTPUT_HIGH) },
           { .pin = BSP_IO_PORT_01_PIN_02, .pin_cfg = ((uint32_t) IOPORT_CFG_PORT_DIRECTION_OUTPUT
-                  | (uint32_t) IOPORT_CFG_PORT_OUTPUT_LOW) },
-          { .pin = BSP_IO_PORT_01_PIN_03, .pin_cfg = ((uint32_t) IOPORT_CFG_PORT_DIRECTION_OUTPUT
-                  | (uint32_t) IOPORT_CFG_PORT_OUTPUT_LOW) },
-          { .pin = BSP_IO_PORT_01_PIN_04, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
-                  | (uint32_t) IOPORT_PERIPHERAL_QSPI) },
+                  | (uint32_t) IOPORT_CFG_PORT_OUTPUT_HIGH) },
           { .pin = BSP_IO_PORT_01_PIN_08, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
                   | (uint32_t) IOPORT_PERIPHERAL_DEBUG) },
           { .pin = BSP_IO_PORT_01_PIN_09, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
                   | (uint32_t) IOPORT_PERIPHERAL_DEBUG) },
-          { .pin = BSP_IO_PORT_01_PIN_10, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
-                  | (uint32_t) IOPORT_PERIPHERAL_DEBUG) },
-          /* JLINK_OB_LED_L (DS11, active low: 3V3 -> DS11 -> R53 -> P111). Driven as a
-           * GPIO status LED, so it must NOT be handed to GPT1. Idle high = LED off. */
+          /* JLINK_OB_LED_L (DS11, active low: 3V3 -> DS11 -> R53 470R -> P111). Driven as a
+           * GPIO status LED, so it must NOT be handed to GPT3. Push-pull, idle high = LED off. */
           { .pin = BSP_IO_PORT_01_PIN_11, .pin_cfg = ((uint32_t) IOPORT_CFG_PORT_DIRECTION_OUTPUT
                   | (uint32_t) IOPORT_CFG_PORT_OUTPUT_HIGH) },
-          { .pin = BSP_IO_PORT_01_PIN_12, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
-                  | (uint32_t) IOPORT_PERIPHERAL_SCI0_2_4_6_8) },
+          { .pin = BSP_IO_PORT_01_PIN_12, .pin_cfg = ((uint32_t) IOPORT_CFG_PORT_DIRECTION_OUTPUT
+                  | (uint32_t) IOPORT_CFG_PORT_OUTPUT_HIGH) },
+          { .pin = BSP_IO_PORT_02_PIN_00, .pin_cfg = ((uint32_t) IOPORT_CFG_IRQ_ENABLE
+                  | (uint32_t) IOPORT_CFG_PORT_DIRECTION_INPUT) },
           { .pin = BSP_IO_PORT_03_PIN_00, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
                   | (uint32_t) IOPORT_PERIPHERAL_DEBUG) },
-          { .pin = BSP_IO_PORT_04_PIN_02, .pin_cfg = ((uint32_t) IOPORT_CFG_PORT_DIRECTION_OUTPUT
-                  | (uint32_t) IOPORT_CFG_PORT_OUTPUT_HIGH) },
+          /* JLINK_OB_RXD reaches TP105 only - nothing drives it. The internal pull-up keeps
+           * SCI2 RX idling at mark, so the unconditional R_SCI_UART_Open() at boot cannot be
+           * flooded with framing errors from a floating pad. */
+          { .pin = BSP_IO_PORT_03_PIN_01, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
+                  | (uint32_t) IOPORT_CFG_PULLUP_ENABLE | (uint32_t) IOPORT_PERIPHERAL_SCI0_2_4_6_8) },
+          { .pin = BSP_IO_PORT_03_PIN_02, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
+                  | (uint32_t) IOPORT_PERIPHERAL_SCI0_2_4_6_8) },
           { .pin = BSP_IO_PORT_04_PIN_07, .pin_cfg = ((uint32_t) IOPORT_CFG_PERIPHERAL_PIN
                   | (uint32_t) IOPORT_PERIPHERAL_USB_FS) }, };
 

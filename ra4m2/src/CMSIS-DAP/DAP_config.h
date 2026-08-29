@@ -450,6 +450,10 @@ __STATIC_FORCEINLINE void     PIN_SWDIO_OUT_DISABLE (void) {
 __STATIC_FORCEINLINE uint32_t PIN_TDI_IN  (void) {
   uint32_t val;
 
+  /* Was returning an uninitialised local, which DAP_SWJ_Pins then folded into the
+   * reply. DAP_JTAG is 0 and P000 is a no-connect on this board, but read it back
+   * anyway so the value is defined, matching PIN_TDO_IN/PIN_nTRST_IN. */
+  val = R_BSP_PinRead(PIN_CMSIS_DAP_TDI);
   return val;
 
 }

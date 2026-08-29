@@ -721,12 +721,16 @@ static bool window_readable(uint32_t base) {
 }
 
 static bool pick_read_window(void) {
+    // Deliberately vendor-agnostic: the suite should not need to be told what
+    // is on the other end of the wire. 0x08000000 covers EFR32 Series 2 and the
+    // STM32 family alike; 0x0C000000 is the secure alias several ARMv8-M parts
+    // expose for the same flash.
     static const uint32_t cand[] = {
-        0x0C000000,   // STM32U5 secure flash alias
-        0x08000000,   // non-secure flash alias / classic STM32 flash
+        0x08000000,   // main flash on EFR32 Series 2, STM32, and others
+        0x0C000000,   // secure alias of the same flash on TrustZone parts
         0x00000000,   // boot-mapped flash (RA, and many others)
+        0x0FE08000,   // Silicon Labs Series 2 device information page
         0x1FF00000,   // STM32 system memory (bootloader ROM)
-        0x0BF90000,   // STM32U5 system memory, secure alias
     };
     if (window_readable(g_rdbase)) return true;
     if (g_rdbase_fixed) return false;

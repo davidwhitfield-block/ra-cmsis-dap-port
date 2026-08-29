@@ -74,20 +74,24 @@ in `--buffer` (default 64 KiB).
 
 ### TrustZone targets
 
-On a Cortex-M33 part the AP's `CSW[30]` (HNONSEC) decides whether accesses are
+On an ARMv8-M part the AP's `CSW[30]` (HNONSEC) decides whether accesses are
 secure. Its value after a target reset is *not* the value running firmware
 leaves behind, so inheriting whatever happens to be in CSW means the first read
 after a reset asks for non-secure access to a now-secure region and FAULTs.
-`daptest` sets the field deliberately and picks the attribute by trying secure
-first and falling back to non-secure. If the configured read window is
-unreachable it probes known aliases (including `0x0C000000`, the STM32U5 secure
-flash alias) and, failing that, catches the target at its reset vector before
-its firmware can close the port.
+This was not theoretical: it broke every block read in this suite until it was
+handled, while single-word reads of the PPB kept working and made it look like a
+transport bug.
+
+`daptest` therefore sets the field deliberately and picks the attribute by
+trying secure first and falling back to non-secure. If the configured read
+window is unreachable it probes known aliases and, failing that, catches the
+target at its reset vector before its firmware can close the port.
 
 ### Reference numbers
 
-Measured against an STM32U585 target at `DAP_PACKET_SIZE` 1024,
-`DAP_PACKET_COUNT` 8:
+Measured against a Silicon Labs EFR32MG24 target (Cortex-M33, `DEVINFO.PART`
+family 24 / device 1010) at `DAP_PACKET_SIZE` 1024, `DAP_PACKET_COUNT` 8. Three
+consecutive `daptest all` runs were 11/11:
 
 ```
 transport   5330 DAP round trips/s (0.19 ms each)

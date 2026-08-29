@@ -16,11 +16,26 @@
 
 /* Status LED (DS11 on P111, JLINK_OB_LED_L, active low).
  *
- * Not enumerated on a USB host -> slow blink, so a board that never comes up
- * is obvious at a glance. Enumerated and configured -> solid on.
+ * Behaves like a J-Link: solid while idle and enumerated, pulsing while debug
+ * traffic is actually moving over SWD, slow blink if the board never enumerated.
+ * The pulse is what makes it obvious at a glance whether a read, an erase or a
+ * flash is really running, rather than the host being wedged.
  *
- * Half-period of the "not enumerated" blink, in RTOS ticks. */
-#define STATUS_LED_BLINK_TICKS pdMS_TO_TICKS(500)
+ * Activity is measured in DAP commands rather than bytes because the two
+ * directions are wildly asymmetric: a block READ returns ~1 KiB for a 5-byte
+ * request, a block WRITE sends ~1 KiB and returns 4 bytes. Command rate is
+ * roughly the same for both, so counting commands makes reads, writes and
+ * erases all pulse at a comparable rate. */
+#define STATUS_LED_BLINK_TICKS  pdMS_TO_TICKS(500)  /* not enumerated: half period */
+#define ACTIVITY_LED_COMMANDS   24U                 /* commands per toggle at full rate */
+#define ACTIVITY_LED_MIN_TICKS  pdMS_TO_TICKS(25)   /* toggle ceiling, else it blurs */
+#define ACTIVITY_LED_MAX_TICKS  pdMS_TO_TICKS(120)  /* toggle floor, so light traffic still shows */
+#define ACTIVITY_LED_IDLE_TICKS pdMS_TO_TICKS(200)  /* quiet for this long -> back to solid */
+
+/* Bumped once per executed DAP command. Written only by the DAP thread and read
+ * only by the DAP thread, so it needs no synchronisation; volatile just keeps
+ * the compiler from caching it across the loop. */
+static volatile uint32_t g_dap_activity;
 
 /* external variables*/
 extern uint8_t g_apl_configuration[];
@@ -35,11 +50,16 @@ void SWO_TransferComplete(void);
 static bool b_usb_configured = false;
 
 /*******************************************************************************************************************//**
- * @brief Drive the board status LED from the USB enumeration state.
+ * @brief Drive the board status LED from USB enumeration state and SWD activity.
  *
- * Solid while the device is configured on a host, slow blink otherwise. Called
- * from the DAP thread loop, which turns over at least once per tick, so the
- * blink phase is derived from the tick count rather than a local counter.
+ * Three states:
+ *   not enumerated      slow blink, so a board that never came up is obvious
+ *   enumerated, idle    solid on
+ *   enumerated, busy    pulsing, at a rate that tracks the DAP command rate
+ *
+ * Called from the DAP thread loop, which turns over at least once per tick.
+ * The pin is only written when the level actually changes, so a loop spinning
+ * at full rate does not put a redundant port write between every DAP command.
  **********************************************************************************************************************/
 static void status_led_update (void)
 {
@@ -48,20 +68,60 @@ static void status_led_update (void)
         return;                        /* board has no status LED */
     }
 
+    static bsp_io_level_t last_level    = LED_STATUS_OFF_LEVEL;
+    static bool           level_valid   = false;
+    static uint32_t       prev_count    = 0U;   /* for edge detection */
+    static uint32_t       toggle_base   = 0U;   /* command count at last toggle */
+    static TickType_t     last_toggle   = 0U;
+    static TickType_t     last_activity = 0U;
+    static bool           pulse_off     = false;
+
+    TickType_t     now   = xTaskGetTickCount();
+    uint32_t       count = g_dap_activity;
     bsp_io_level_t level;
 
-    if (b_usb_configured)
+    if (count != prev_count)
     {
-        level = LED_STATUS_ON_LEVEL;
+        prev_count    = count;
+        last_activity = now;
+    }
+
+    if (!b_usb_configured)
+    {
+        bool on = ((now / STATUS_LED_BLINK_TICKS) & 1U) != 0U;
+        level = on ? LED_STATUS_ON_LEVEL : LED_STATUS_OFF_LEVEL;
+    }
+    else if ((TickType_t) (now - last_activity) < ACTIVITY_LED_IDLE_TICKS)
+    {
+        /* Busy. Toggle once enough commands have gone by, or once enough time
+         * has passed that a low-rate transfer would otherwise look idle - but
+         * never faster than ACTIVITY_LED_MIN_TICKS, which would just look dim. */
+        TickType_t since = (TickType_t) (now - last_toggle);
+
+        if ((since >= ACTIVITY_LED_MIN_TICKS) &&
+            (((uint32_t) (count - toggle_base) >= ACTIVITY_LED_COMMANDS) ||
+             (since >= ACTIVITY_LED_MAX_TICKS)))
+        {
+            pulse_off   = !pulse_off;
+            last_toggle = now;
+            toggle_base = count;
+        }
+
+        level = pulse_off ? LED_STATUS_OFF_LEVEL : LED_STATUS_ON_LEVEL;
     }
     else
     {
-        /* Alternate every STATUS_LED_BLINK_TICKS. */
-        bool on = ((xTaskGetTickCount() / STATUS_LED_BLINK_TICKS) & 1U) != 0U;
-        level = on ? LED_STATUS_ON_LEVEL : LED_STATUS_OFF_LEVEL;
+        pulse_off   = false;
+        toggle_base = count;
+        level       = LED_STATUS_ON_LEVEL;
     }
 
-    R_BSP_PinWrite((bsp_io_port_pin_t) g_bsp_leds.p_leds[LED_INDEX_STATUS], level);
+    if (!level_valid || (level != last_level))
+    {
+        R_BSP_PinWrite((bsp_io_port_pin_t) g_bsp_leds.p_leds[LED_INDEX_STATUS], level);
+        last_level  = level;
+        level_valid = true;
+    }
 }
 static usb_pcdc_linecoding_t g_line_coding;
 
@@ -360,6 +420,11 @@ void dap_thread_entry(void *pvParameters)
                 // Execute DAP Command (process request and prepare response)
                 USB_RespSize[USB_ResponseIndexI] =
                     (uint16_t)DAP_ExecuteCommand(USB_Request[USB_RequestIndexO], USB_Response[USB_ResponseIndexI]);
+
+                /* Feeds the activity pulse on the status LED. One increment per
+                 * command is negligible next to the SWD traffic the command
+                 * just did, so this stays off the critical path. */
+                g_dap_activity++;
 
                 // Update Request Index and Count
                 USB_RequestIndexO++;

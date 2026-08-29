@@ -75,7 +75,13 @@ extern bsp_leds_t g_bsp_leds;
 
 /// Processor Clock of the Cortex-M MCU used in the Debug Unit.
 /// This value is used to calculate the SWD/JTAG clock speed.
-#define CPU_CLOCK               100000000U      ///< Specifies the CPU Clock in Hz.
+///
+/// Must match the real ICLK, which bsp_clock_cfg.h sets to 96 MHz (12 MHz XTAL
+/// -> PLL x16 = 192 MHz -> ICLK /2). This used to claim 100 MHz against an
+/// actual 60 MHz, so DAP.c sized its delay loop for a CPU 1.67x faster than the
+/// one running it and every DAP_SWJ_Clock request came out that much slower
+/// than asked for. Keep this in step with BSP_CFG_PLL_MUL / BSP_CFG_ICLK_DIV.
+#define CPU_CLOCK               96000000U       ///< Specifies the CPU Clock in Hz.
 
 /// Number of processor cycles for I/O Port write operations.
 /// This value is used to calculate the SWD/JTAG clock speed that is generated with I/O
@@ -110,13 +116,29 @@ extern bsp_leds_t g_bsp_leds;
 /// This configuration settings is used to optimize the communication performance with the
 /// debugger and depends on the USB peripheral. Typical vales are 64 for Full-speed USB HID or WinUSB,
 /// 1024 for High-speed USB HID and 512 for High-speed USB WinUSB.
-#define DAP_PACKET_SIZE         64U            ///< Specifies Packet Size in bytes.
+///
+/// This is a CMSIS-DAP v2 (bulk) probe, so a DAP packet is one USB *transfer*,
+/// not one USB packet - the 64-byte wMaxPacketSize of a full-speed bulk
+/// endpoint does not bound it, and the host driver reassembles the fragments.
+/// At 64 a DAP_TransferBlock response carried only (64-4)/4 = 15 words, so each
+/// ~240 us of fixed per-command firmware/USB overhead bought just 60 bytes of
+/// target data and RTT drain topped out around 86 KiB/s. At 1024 the same
+/// overhead buys 255 words = 1020 bytes, which is what makes SystemView-rate
+/// streaming possible. See DAP_PACKET_COUNT for the RAM trade.
+#define DAP_PACKET_SIZE         1024U          ///< Specifies Packet Size in bytes.
 
 /// Maximum Package Buffers for Command and Response data.
 /// This configuration settings is used to optimize the communication performance with the
 /// debugger and depends on the USB peripheral. For devices with limited RAM or USB buffer the
 /// setting can be reduced (valid range is 1 .. 255).
-#define DAP_PACKET_COUNT        255U              ///< Specifies number of packets buffered.
+///
+/// dap_thread_entry.c statically allocates USB_Request[COUNT][SIZE] and
+/// USB_Response[COUNT][SIZE], so this multiplies against DAP_PACKET_SIZE. The
+/// part has 128 KB of SRAM and bss was already at ~121 KB, so 255 x 1024 x 2 is
+/// not remotely affordable; 8 x 1024 x 2 = 16 KB is actually ~16 KB *less* than
+/// the 255 x 64 x 2 it replaces. Measured queue depth beyond 4 buys nothing
+/// here - the device, not the host pipeline, is the limiter - so 8 is headroom.
+#define DAP_PACKET_COUNT        8U                ///< Specifies number of packets buffered.
 
 /// Indicate that UART Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
@@ -348,17 +370,50 @@ __STATIC_INLINE void PORT_OFF (void) {
 }
 
 
+/* Fast SWD pin access -----------------------------------------------------
+ *
+ * These are the innermost operations in the whole firmware: one SWD bit costs
+ * two SWCLK edges, and a 32-bit read costs ~46 of them. Going through
+ * R_BSP_PinWrite()/R_BSP_PinRead() means a non-inlined HAL call that decodes
+ * the port/pin pair on every edge, and R_BSP_PinCfg() - which the SWDIO
+ * direction switch used, twice per transfer - additionally rewrites a PmnPFS
+ * register behind the PWPR write-protect unlock/lock dance. Measured on the
+ * X2C automation board that capped the usable SWD clock at ~1.6 MHz no matter
+ * what DAP_SWJ_Clock asked for, which is well under what an RTT/SystemView
+ * drain needs.
+ *
+ * SWDIO (P101), SWCLK (P102) and nRESET (P112) all live on port 1, so every
+ * operation below is a single load or store to one port, with no PFS access
+ * at all. Register layout is per R01UH0892EJ sections 19.2.1-19.2.3:
+ *
+ *   PCNTR1  [15:0] PDR   direction, 1 = output      [31:16] PODR  output data
+ *   PCNTR2  [15:0] PIDR  pin state (read-only)
+ *   PCNTR3  [15:0] POSR  write 1 to drive high      [31:16] PORR  write 1 to drive low
+ *
+ * Note the 16-bit aliases of PCNTR3 are documented at what look like swapped
+ * offsets (PORR at 0x008, POSR at 0x00A); the 32-bit view above is the one the
+ * manual and the FSP header agree on, so use only that.
+ *
+ * The pins are left as configured by g_bsp_pin_cfg (GPIO, PMR = 0) - nothing
+ * here touches PFS, so that initial configuration must stay GPIO. */
+#define DAP_SWD_PORT        R_PORT1
+#define DAP_SWDIO_BIT       1U      /* P101 - DEBUG_SPE_SWDIO_3V3 */
+#define DAP_SWCLK_BIT       2U      /* P102 - DEBUG_SPE_SWCLK_3V3 */
+#define DAP_NRESET_BIT      12U     /* P112 - SPE_MCU_RESET_L_3V3 */
+
+#define DAP_PIN_SET(bit)    (DAP_SWD_PORT->PCNTR3 = (1UL << (bit)))          /* POSR */
+#define DAP_PIN_CLR(bit)    (DAP_SWD_PORT->PCNTR3 = (1UL << ((bit) + 16U)))  /* PORR */
+#define DAP_PIN_GET(bit)    ((DAP_SWD_PORT->PCNTR2 >> (bit)) & 1UL)          /* PIDR */
+#define DAP_PIN_DIR_OUT(bit) (DAP_SWD_PORT->PCNTR1 |= (1UL << (bit)))        /* PDR = 1 */
+#define DAP_PIN_DIR_IN(bit)  (DAP_SWD_PORT->PCNTR1 &= ~(1UL << (bit)))       /* PDR = 0 */
+
 // SWCLK/TCK I/O pin -------------------------------------
 
 /** SWCLK/TCK I/O pin: Get Input.
 \return Current status of the SWCLK/TCK DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE uint32_t PIN_SWCLK_TCK_IN  (void) {
-  uint32_t val;
-
-  val = R_BSP_PinRead(PIN_CMSIS_DAP_SWCLK);
-  return val;
-
+  return DAP_PIN_GET(DAP_SWCLK_BIT);
 }
 
 /** SWCLK/TCK I/O pin: Set Output to High.
@@ -366,7 +421,7 @@ Set the SWCLK/TCK DAP hardware I/O pin to high level.
 */
 __STATIC_FORCEINLINE void PIN_SWCLK_TCK_SET(void)
 {
-  R_BSP_PinWrite(PIN_CMSIS_DAP_SWCLK, BSP_IO_LEVEL_HIGH);
+  DAP_PIN_SET(DAP_SWCLK_BIT);
 }
 
 /** SWCLK/TCK I/O pin: Set Output to Low.
@@ -374,7 +429,7 @@ Set the SWCLK/TCK DAP hardware I/O pin to low level.
 */
 __STATIC_FORCEINLINE void PIN_SWCLK_TCK_CLR(void)
 {
-  R_BSP_PinWrite(PIN_CMSIS_DAP_SWCLK, BSP_IO_LEVEL_LOW);
+  DAP_PIN_CLR(DAP_SWCLK_BIT);
 }
 
 
@@ -384,10 +439,7 @@ __STATIC_FORCEINLINE void PIN_SWCLK_TCK_CLR(void)
 \return Current status of the SWDIO/TMS DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE uint32_t PIN_SWDIO_TMS_IN  (void) {
-  uint32_t val;
-
-  val = R_BSP_PinRead(PIN_CMSIS_DAP_SWDIO);
-  return val;
+  return DAP_PIN_GET(DAP_SWDIO_BIT);
 }
 
 /** SWDIO/TMS I/O pin: Set Output to High.
@@ -395,15 +447,15 @@ Set the SWDIO/TMS DAP hardware I/O pin to high level.
 */
 __STATIC_FORCEINLINE void PIN_SWDIO_TMS_SET(void)
 {
-  R_BSP_PinWrite(PIN_CMSIS_DAP_SWDIO, BSP_IO_LEVEL_HIGH);
+  DAP_PIN_SET(DAP_SWDIO_BIT);
 }
 
 /** SWDIO/TMS I/O pin: Set Output to Low.
 Set the SWDIO/TMS DAP hardware I/O pin to low level.
 */
-__STATIC_FORCEINLINE void     PIN_SWDIO_TMS_CLR (void) 
+__STATIC_FORCEINLINE void     PIN_SWDIO_TMS_CLR (void)
 {
-  R_BSP_PinWrite(PIN_CMSIS_DAP_SWDIO, BSP_IO_LEVEL_LOW);
+  DAP_PIN_CLR(DAP_SWDIO_BIT);
 }
 
 /** SWDIO I/O pin: Get Input (used in SWD mode only).
@@ -411,17 +463,18 @@ __STATIC_FORCEINLINE void     PIN_SWDIO_TMS_CLR (void)
 */
 __STATIC_FORCEINLINE uint32_t PIN_SWDIO_IN(void)
 {
-  uint32_t val;
-
-  val = R_BSP_PinRead(PIN_CMSIS_DAP_SWDIO);
-  return val;
+  return DAP_PIN_GET(DAP_SWDIO_BIT);
 }
 
 /** SWDIO I/O pin: Set Output (used in SWD mode only).
 \param bit Output value for the SWDIO DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE void     PIN_SWDIO_OUT     (uint32_t bit) {
-    R_BSP_PinWrite(PIN_CMSIS_DAP_SWDIO, bit & 0x000000001 ? BSP_IO_LEVEL_HIGH : BSP_IO_LEVEL_LOW);
+    if (bit & 1U) {
+        DAP_PIN_SET(DAP_SWDIO_BIT);
+    } else {
+        DAP_PIN_CLR(DAP_SWDIO_BIT);
+    }
 }
 
 /** SWDIO I/O pin: Switch to Output mode (used in SWD mode only).
@@ -429,7 +482,11 @@ Configure the SWDIO DAP hardware I/O pin to output mode. This function is
 called prior \ref PIN_SWDIO_OUT function calls.
 */
 __STATIC_FORCEINLINE void     PIN_SWDIO_OUT_ENABLE  (void) {
-    R_BSP_PinCfg(PIN_CMSIS_DAP_SWDIO, ((uint32_t) IOPORT_CFG_PORT_DIRECTION_OUTPUT | (uint32_t) IOPORT_CFG_PORT_OUTPUT_HIGH));
+    /* Drive the level before enabling the driver, so switching direction
+     * cannot briefly present a stale low on the bus. Matches the previous
+     * R_BSP_PinCfg(OUTPUT | OUTPUT_HIGH) behaviour. */
+    DAP_PIN_SET(DAP_SWDIO_BIT);
+    DAP_PIN_DIR_OUT(DAP_SWDIO_BIT);
 }
 
 /** SWDIO I/O pin: Switch to Input mode (used in SWD mode only).
@@ -437,8 +494,7 @@ Configure the SWDIO DAP hardware I/O pin to input mode. This function is
 called prior \ref PIN_SWDIO_IN function calls.
 */
 __STATIC_FORCEINLINE void     PIN_SWDIO_OUT_DISABLE (void) {
-
-    R_BSP_PinCfg(PIN_CMSIS_DAP_SWDIO, ((uint32_t) IOPORT_CFG_PORT_DIRECTION_INPUT));
+    DAP_PIN_DIR_IN(DAP_SWDIO_BIT);
 }
 
 
@@ -507,10 +563,7 @@ __STATIC_FORCEINLINE void     PIN_nTRST_OUT  (uint32_t bit) {
 \return Current status of the nRESET DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE uint32_t PIN_nRESET_IN  (void) {
-  uint32_t val;
-
-  val = R_BSP_PinRead(PIN_CMSIS_DAP_RESET);
-  return val;
+  return DAP_PIN_GET(DAP_NRESET_BIT);
 }
 
 /** nRESET I/O pin: Set Output.
@@ -519,7 +572,11 @@ __STATIC_FORCEINLINE uint32_t PIN_nRESET_IN  (void) {
            - 1: release device hardware reset.
 */
 __STATIC_FORCEINLINE void     PIN_nRESET_OUT (uint32_t bit) {
-  R_BSP_PinWrite(PIN_CMSIS_DAP_RESET, bit ? BSP_IO_LEVEL_HIGH : BSP_IO_LEVEL_LOW);
+  if (bit) {
+      DAP_PIN_SET(DAP_NRESET_BIT);
+  } else {
+      DAP_PIN_CLR(DAP_NRESET_BIT);
+  }
 }
 
 ///@}

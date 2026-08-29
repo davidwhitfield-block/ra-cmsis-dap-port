@@ -57,6 +57,100 @@
 #define PIN_DELAY() PIN_DELAY_SLOW(DAP_Data.clock_delay)
 
 
+// Read the 32-bit RDATA phase of an SWD read, delay-free path only.
+//
+// The generic SW_READ_BIT loop costs 8 instructions per bit: two port stores and
+// a port load (irreducible - they are the SWD clock and the sample), plus ubfx +
+// lsl + orr to insert the bit, an add to accumulate parity, and subs/bne.
+//
+// Five of those go away. `lsrs` by DAP_SWDIO_BIT+1 drops SWDIO straight into the
+// carry flag and `rrx` rotates it into the accumulator, doing in two instructions
+// what ubfx/lsl/orr did in three and producing exactly the same LSB-first word as
+// `val >>= 1; val |= bit << 31`. Parity is folded once from the finished word
+// instead of being accumulated 32 times - the sum of the bits and their xor agree
+// modulo 2, which is all the parity check looks at. An 8x unroll amortises the
+// loop overhead to a quarter of an instruction per bit.
+//
+// Sampling is unchanged and still SWD-legal: the load sits between the store that
+// drives SWCLK low and the store that drives SWCLK high, exactly where SW_READ_BIT
+// put it, so the target is sampled in the SWCLK-low phase as before. The two ALU
+// ops land after the SWCLK-high store, which is posted, so they drain in its
+// shadow rather than adding to the period.
+//
+// Deliberately left in flash rather than .code_in_ram: at 8x the loop is ~100
+// bytes and stays resident in the 256-byte FCACHE1, whereas SRAM0 and the I/O
+// ports share the System bus, so executing from RAM would serialise instruction
+// fetch against the very port traffic this loop is made of.
+#define SWD_STR_(x) #x
+#define SWD_STR(x)  SWD_STR_(x)
+
+/* lsrs by this leaves SWDIO in C. The assembler needs a literal, so it is spelled
+ * out and checked against the pin map rather than derived. */
+#define SWD_SWDIO_CARRY_SHIFT 2
+_Static_assert(SWD_SWDIO_CARRY_SHIFT == (int)(DAP_SWDIO_BIT + 1U),
+               "SWD_SWDIO_CARRY_SHIFT must track DAP_SWDIO_BIT");
+_Static_assert(DAP_SWCLK_BIT < 16U, "SWCLK must be in the low half of PCNTR3");
+
+__attribute__((noinline))
+static uint32_t SWD_ReadData32 (void) {
+  volatile uint32_t *pidr = &DAP_SWD_PORT->PCNTR2;          /* PIDR  - sample     */
+  volatile uint32_t *pctl = &DAP_SWD_PORT->PCNTR3;          /* POSR/PORR - SWCLK  */
+  uint32_t lo  = 1UL << (DAP_SWCLK_BIT + 16U);              /* PORR: drive low    */
+  uint32_t hi  = 1UL <<  DAP_SWCLK_BIT;                     /* POSR: drive high   */
+  uint32_t v   = 0U;
+  uint32_t cnt = 4U;
+  uint32_t t;
+
+  __asm volatile (
+    ".syntax unified                                      \n"
+    "1:                                                   \n"
+    "   .rept 8                                           \n"
+    "   str  %[lo], [%[pctl]]                             \n"  /* SWCLK low       */
+    "   ldr  %[t],  [%[pidr]]                             \n"  /* sample SWDIO    */
+    "   str  %[hi], [%[pctl]]                             \n"  /* SWCLK high      */
+    "   lsrs %[t],  %[t], #" SWD_STR(SWD_SWDIO_CARRY_SHIFT) "\n" /* C = SWDIO     */
+    "   rrx  %[v],  %[v]                                  \n"  /* val = C:val>>1  */
+    "   .endr                                             \n"
+    "   subs %[cnt], %[cnt], #1                           \n"
+    "   bne  1b                                           \n"
+    /* The "&" on v and cnt is load-bearing, not decoration. Without it GCC is
+     * free to put an input in the same register as an output whenever it can see
+     * the values are equal - and here cnt (4) and hi (1 << DAP_SWCLK_BIT = 4) are
+     * equal, so it really does coalesce them. `subs cnt` then walks the SWCLK
+     * mask down through 3, 2, 1: the second iteration would write 3 to PCNTR3,
+     * driving SWO and SWDIO high instead of clocking SWCLK. Early-clobber says
+     * these are written before the inputs are finished with, which forbids the
+     * sharing. */
+    : [v] "+&l" (v), [t] "=&l" (t), [cnt] "+&l" (cnt)
+    : [pidr] "l" (pidr), [pctl] "l" (pctl), [lo] "l" (lo), [hi] "l" (hi)
+    : "cc", "memory");
+
+  return v;
+}
+
+/* Fold a finished word down to its parity in bit 0. */
+#define SWD_PARITY32(p, v)                                                      \
+  do {                                                                          \
+    uint32_t p_ = (v) ^ ((v) >> 16);                                            \
+    p_ ^= p_ >> 8;  p_ ^= p_ >> 4;                                              \
+    p_ ^= p_ >> 2;  p_ ^= p_ >> 1;                                              \
+    (p) = p_;                                                                   \
+  } while (0)
+
+/* The portable read used by the delay-inserting (Slow) instantiation. */
+#define SW_READ_DATA32_GENERIC()                                                \
+      val = 0U;                                                                 \
+      parity = 0U;                                                              \
+      for (n = 32U; n; n--) {                                                   \
+        SW_READ_BIT(bit);               /* Read RDATA[0:31] */                  \
+        parity += bit;                                                          \
+        val >>= 1;                                                              \
+        val  |= bit << 31;                                                      \
+      }
+
+#define SW_READ_DATA32() SW_READ_DATA32_GENERIC()
+
+
 // Generate SWJ Sequence
 //   count:  sequence bit count
 //   data:   pointer to sequence bit data
@@ -179,14 +273,7 @@ static uint8_t SWD_Transfer##speed (uint32_t request, uint32_t *data) {         
     /* Data transfer */                                                         \
     if (request & DAP_TRANSFER_RnW) {                                           \
       /* Read data */                                                           \
-      val = 0U;                                                                 \
-      parity = 0U;                                                              \
-      for (n = 32U; n; n--) {                                                   \
-        SW_READ_BIT(bit);               /* Read RDATA[0:31] */                  \
-        parity += bit;                                                          \
-        val >>= 1;                                                              \
-        val  |= bit << 31;                                                      \
-      }                                                                         \
+      SW_READ_DATA32();                 /* Read RDATA[0:31] */                  \
       SW_READ_BIT(bit);                 /* Read Parity */                       \
       if ((parity ^ bit) & 1U) {                                                \
         ack = DAP_TRANSFER_ERROR;                                               \
@@ -261,12 +348,21 @@ static uint8_t SWD_Transfer##speed (uint32_t request, uint32_t *data) {         
 }
 
 
+/* Fast: no inter-edge delay, so the hand-rolled 32-bit read applies. */
 #undef  PIN_DELAY
 #define PIN_DELAY() PIN_DELAY_FAST()
+#undef  SW_READ_DATA32
+#define SW_READ_DATA32()                                                        \
+      val = SWD_ReadData32();                                                   \
+      SWD_PARITY32(parity, val);
 SWD_TransferFunction(Fast)
 
+/* Slow: every edge must carry PIN_DELAY_SLOW to honour a sub-maximum clock
+ * request, so this one keeps the portable bit loop. */
 #undef  PIN_DELAY
 #define PIN_DELAY() PIN_DELAY_SLOW(DAP_Data.clock_delay)
+#undef  SW_READ_DATA32
+#define SW_READ_DATA32() SW_READ_DATA32_GENERIC()
 SWD_TransferFunction(Slow)
 
 

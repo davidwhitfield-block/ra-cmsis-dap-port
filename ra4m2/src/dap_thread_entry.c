@@ -960,15 +960,25 @@ void usb_composite_callback(usb_event_info_t *p_event_info, usb_hdl_t handler, u
     FSP_PARAMETER_NOT_USED(handler);
     FSP_PARAMETER_NOT_USED(on_off);
 
-    if ((p_event_info->event == USB_STATUS_WRITE_COMPLETE) && (swo_pipe == p_event_info->pipe))
-    {
-        (void)xSemaphoreGive(g_sem_DAP_Thread);
-    }
-
     if (pdTRUE != (xQueueSend(g_queue_usb_event, (const void *)&p_event_info, (TickType_t)(RESET_VALUE))))
     {
         APP_ERR_PRINT("\r\n !! usb_composite_callback xQueueSend failed. \r\n");
     }
+
+    /* Wake the DAP thread for EVERY USB event, not just SWO writes.
+     *
+     * The thread parks on xSemaphoreTake(g_sem_DAP_Thread, 1) and posting to
+     * g_queue_usb_event does not unblock a task waiting on a semaphore, so
+     * before this the arrival of a DAP command woke nothing: the thread slept
+     * until the next SysTick. At configTICK_RATE_HZ = 1000 that is up to 1 ms,
+     * 0.5 ms on average, added every time the request pipeline drains - and it
+     * is a fixed wall-clock cost, so no amount of ICLK or SWD clock removes it.
+     *
+     * This runs in the PCD task's context rather than an ISR (usb_set_event ->
+     * g_usb_apl_callback), so the non-FromISR give is the correct call. The
+     * semaphore is binary, so a give while the DAP thread is already running is
+     * retained and the next take returns immediately - no lost wakeup. */
+    (void)xSemaphoreGive(g_sem_DAP_Thread);
 }
 
 /*******************************************************************************************************************/ /**

@@ -89,7 +89,29 @@ extern bsp_leds_t g_bsp_leds;
 /// require 2 processor cycles for a I/O Port Write operation.  If the Debug Unit uses
 /// a Cortex-M0+ processor with high-speed peripheral I/O only 1 processor cycle might be
 /// required.
-#define IO_PORT_WRITE_CYCLES    2U              ///< I/O Cycles: 2=default, 1=Cortex-M0+ fast I/0.
+///
+/// 13, not the stock 2. This constant is DAP.c's model of what one SWD half-period
+/// costs, and it drives two things:
+///   MAX_SWJ_CLOCK(d) = (CPU_CLOCK/2)/(IO_PORT_WRITE_CYCLES + d)
+///   clock_delay      = ceil((CPU_CLOCK/2/requested - IO_PORT_WRITE_CYCLES)
+///                           / DELAY_SLOW_CYCLES)
+/// The stock 2 assumes a port write costs 2 CPU cycles. It does not here: the I/O
+/// ports hang off PLBIU, clocked by PCLKB at ICLK/2, and R01UH0892EJ table A3.2
+/// prices a PORT access at 2-4 PCLKB for a write and 2-5 PCLKB for a read - so
+/// 4-10 ICLK each, not 2. Measured on this board a full SWD clock costs ~25 ICLK
+/// (96 MHz / 3.8 MHz sustained on the delay-free path), i.e. ~12.6 per half-period.
+///
+/// Getting this wrong is not cosmetic. At 2 the model believes the probe can bit-bang
+/// at 24 MHz, so for every host request below 24 MHz it "corrects" by padding each
+/// half-period with PIN_DELAY_SLOW - and the probe ends up SLOWER than what the host
+/// actually asked for. A host requesting 2 MHz was getting ~1.35 MHz. At 13 the
+/// arithmetic reflects reality: requests at or above ~3.7 MHz take the delay-free
+/// path and run at the ~3.8 MHz the hardware can actually do (never faster than
+/// asked), and slower requests get an accurately calibrated delay.
+///
+/// This matters for real hosts. OpenOCD and pyOCD ask for 1-10 MHz; only a request
+/// >= 24 MHz used to reach the fast path, so ordinary tools never did.
+#define IO_PORT_WRITE_CYCLES    13U             ///< Measured PLBIU port cost, see above.
 
 /// Indicate that Serial Wire Debug (SWD) communication mode is available at the Debug Access Port.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.

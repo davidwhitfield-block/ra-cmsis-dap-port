@@ -9,17 +9,26 @@
 //   ./daptest all   # run everything
 //
 // Subcommands (see usage() at the bottom):
+//   transport   DAP round-trip rate with no SWD work, to separate the two costs
+//   coherence   block reads and single-word reads of the same memory must agree
 //   read        sustained verified read, default 10 MiB, asserts bandwidth
 //   write       write bandwidth + readback verify, non-destructive (save/restore)
 //   resetloop   assert/release target nRESET repeatedly, assert SWD recovers
+//   srst        SWD-only reset+halt via vector catch, no nRESET wire needed
+//   halt        reset and hold at the reset vector (recovery for a locked target)
 //   depth       prove pipelining past DAP_PACKET_COUNT corrupts, and <= is clean
 //   clock       assert the delivered SWD rate tracks the requested rate
 //   fault       read unmapped memory, assert a clean FAULT and full recovery
 //   churn       repeated SWD connect/disconnect
-//   soak        long verified read with a hard bandwidth floor
-//   all         every case above, with a pass/fail summary
+//   soak        long verified read, judged by backlog against an RTT producer
+//   all         every case above except halt, with a pass/fail summary
 //
 // Exit status is the number of failed cases (0 = all pass).
+//
+// Every read case verifies its bytes against a golden first pass. A throughput
+// number from an engine that never compared what it received is worthless: this
+// tool's predecessor reported 249 KiB/s while silently corrupting data, because
+// it pipelined past DAP_PACKET_COUNT and stopped matching responses to commands.
 #define _GNU_SOURCE
 #include <libusb-1.0/libusb.h>
 #include <stdio.h>
@@ -256,6 +265,51 @@ static bool dap_nreset(int assert_low) {
     return dap_cmd(c, 7, r, sizeof r) >= 2;
 }
 
+// ---- AP configuration -------------------------------------------------------
+// CSW[30] is HNONSEC on an AHB5-AP (Cortex-M33 and friends). On a TrustZone part
+// the reset default and the value left behind by running firmware are NOT the
+// same, and inheriting whatever happens to be there means the first block read
+// after a target reset asks for non-secure access to a now-secure region and
+// FAULTs. So set the whole field deliberately, and pick the security attribute
+// by trying it rather than assuming - SPIDEN (CSW[23], read-only) says secure
+// debug is permitted, not that every region wants it.
+#define CSW_HNONSEC   (1u << 30)
+#define CSW_SIZE_INC  0x12u             // 32-bit transfers, auto-increment single
+
+static int g_csw_nonsec = -1;           // which attribute we settled on
+
+// Single-word read that first clears any sticky error, so the result reflects
+// this access and not a leftover from the previous one.
+static int mem_probe(uint32_t addr, uint32_t *val) {
+    xfer1(DP_ABORT_W, 0x0000001E, NULL);
+    if (xfer1(AP_TAR_W, addr, NULL) != 1) return -1;
+    int ack = xfer1(AP_DRW_R, 0, NULL);
+    if (ack != 1) return ack;
+    return xfer1(DP_RDBUFF_R, 0, val);
+}
+
+static bool ap_write_csw(int nonsec) {
+    uint32_t csw = 0;
+    xfer1(DP_ABORT_W, 0x0000001E, NULL);
+    xfer1(AP_CSW_R, 0, NULL);
+    if (xfer1(DP_RDBUFF_R, 0, &csw) != 1) return false;
+    csw = (csw & ~(CSW_HNONSEC | 0x3Fu)) | CSW_SIZE_INC | (nonsec ? CSW_HNONSEC : 0u);
+    return xfer1(AP_CSW_W, csw, NULL) == 1;
+}
+
+// Configure AP0 for 32-bit auto-incrementing access and choose the security
+// attribute that can actually reach `probe_addr`. Secure is tried first: a
+// secure access reaches non-secure memory as well, the converse is not true.
+static bool ap_configure(const uint32_t *probe_addr) {
+    uint32_t addr = probe_addr ? *probe_addr : 0xE000ED00u;   // CPUID always exists
+    for (int nonsec = 0; nonsec <= 1; nonsec++) {
+        if (!ap_write_csw(nonsec)) continue;
+        uint32_t v = 0;
+        if (mem_probe(addr, &v) == 1) { g_csw_nonsec = nonsec; return true; }
+    }
+    return false;
+}
+
 // Full SWD bring-up: connect, line reset, DPIDR, power up debug, configure AP0.
 static bool swd_connect(uint32_t clock_hz, uint32_t *out_idcode) {
     uint8_t c[16], r[64];
@@ -291,12 +345,7 @@ static bool swd_connect(uint32_t clock_hz, uint32_t *out_idcode) {
         if ((s & 0xA0000000u) == 0xA0000000u) { powered = true; break; }
     }
     if (!powered) return false;
-
-    uint32_t csw = 0;
-    xfer1(AP_CSW_R, 0, &csw);
-    xfer1(DP_RDBUFF_R, 0, &csw);
-    csw = (csw & ~0x3Fu) | 0x12u;                    // 32-bit, auto-increment single
-    return xfer1(AP_CSW_W, csw, NULL) == 1;
+    return ap_configure(NULL);
 }
 
 // ---- single-word memory access ---------------------------------------------
@@ -475,8 +524,28 @@ static void bucket_tick(double now) {
 }
 
 static int consume(const uint8_t *rsp, int n, int rlen, int payload, long woff) {
-    if (payload == 0) { if (n < 3) g_res.short_err++; return 0; }
-    if (n < rlen)     { g_res.short_err++; return 0; }
+    if (payload == 0) {
+        /* The TAR write. Its ACK has to be checked here: if it faults, every
+         * block that follows faults too, and blaming the block read sends you
+         * looking in the wrong place entirely. */
+        if (n < 3) {
+            g_res.short_err++;
+            if (g_verbose) fprintf(stderr, "  short TAR rsp: n=%d after %llu bytes\n",
+                                   n, (unsigned long long)g_res.bytes);
+        } else if (rsp[2] != 1) {
+            g_res.ack_err++;
+            if (g_verbose) fprintf(stderr, "  TAR write ack=%u after %llu bytes\n",
+                                   rsp[2], (unsigned long long)g_res.bytes);
+        }
+        return 0;
+    }
+    if (n < rlen) {
+        g_res.short_err++;
+        if (g_verbose) fprintf(stderr, "  short blk rsp: n=%d want %d, cmd=%02X cnt=%u ack=%u, after %llu bytes\n",
+                               n, rlen, rsp[0], n >= 3 ? (unsigned)(rsp[1] | (rsp[2] << 8)) : 0u,
+                               n >= 4 ? rsp[3] : 0, (unsigned long long)g_res.bytes);
+        return 0;
+    }
     if (rsp[3] != 1)  { g_res.ack_err++;   return 0; }
     if (g_cfg.write)  return payload;
 
@@ -619,10 +688,70 @@ static double   g_min_read_kib  = 280.0;
 static double   g_min_write_kib = 280.0;
 static int      g_depth   = 8;
 static int      g_iters   = 20;
+/* The soak case is judged against a real workload: a SystemView capture from a
+ * riker payment soak produces about 160 KiB/s into an RTT buffer. A stall only
+ * loses trace data if the backlog it builds outgrows that buffer. */
+static double   g_soak_produce_kib = 160.0;
+static double   g_soak_buffer_kib  = 64.0;
+static uint64_t g_soak_mb = 64;
+
+static int g_rdbase_fixed;              // user passed --rdbase, do not second-guess it
 
 static bool reconnect(void) {
+    /* Realign the USB stream before anything else. Whatever went wrong may have
+     * left responses queued, and a DAP_Disconnect issued into a desynced stream
+     * just makes it worse. */
+    dap_flush();
+    dap_in_sync();
     dap_disconnect();
     return swd_connect(g_clock, NULL);
+}
+
+// The read window has to be static memory that the current security attribute
+// can actually reach. On a TrustZone part the same flash appears at a secure and
+// a non-secure alias and only one of them answers, so probe rather than assume.
+// A window is only accepted if two reads agree and the contents are not all one
+// value - a FAULTing AP happily returns a consistent 0x00000000.
+static bool window_readable(uint32_t base) {
+    uint32_t a = 0, b = 0, c = 0;
+    if (mem_probe(base, &a) != 1) return false;
+    if (mem_probe(base, &b) != 1 || a != b) return false;
+    if (mem_probe(base + WINDOW_BYTES - 4, &c) != 1) return false;
+    return !(a == 0 && c == 0) && !(a == 0xFFFFFFFFu && c == 0xFFFFFFFFu);
+}
+
+static bool pick_read_window(void) {
+    static const uint32_t cand[] = {
+        0x0C000000,   // STM32U5 secure flash alias
+        0x08000000,   // non-secure flash alias / classic STM32 flash
+        0x00000000,   // boot-mapped flash (RA, and many others)
+        0x1FF00000,   // STM32 system memory (bootloader ROM)
+        0x0BF90000,   // STM32U5 system memory, secure alias
+    };
+    if (window_readable(g_rdbase)) return true;
+    if (g_rdbase_fixed) return false;
+    for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++)
+        if (cand[i] != g_rdbase && window_readable(cand[i])) { g_rdbase = cand[i]; return true; }
+    return false;
+}
+
+static int reset_halt_via_swd(void);
+static int g_leave_halted;
+
+// Make sure the read window is reachable before a case depends on it, and if it
+// is not, climb the recovery ladder: realign USB, re-negotiate the AP security
+// attribute, and finally catch the target at its reset vector before its
+// firmware has had a chance to close the debug port. This is the same escalation
+// a flashing tool needs on a part whose firmware locks debug on boot; here it
+// also keeps one failing case from cascading into every case after it.
+static bool ensure_readable(void) {
+    if (window_readable(g_rdbase)) return true;
+    if (reconnect() && window_readable(g_rdbase)) return true;
+    if (reset_halt_via_swd() == 0) {
+        g_leave_halted = 1;
+        if (ap_configure(NULL) && pick_read_window()) return true;
+    }
+    return false;
 }
 
 // --- transport-only baseline: DAP_Info round trips do zero SWD work, so this
@@ -642,6 +771,7 @@ static int t_transport(void) {
 // --- reads of a constant register must never vary. Cheapest detector for the
 // --- response/command desync class of bug.
 static int t_coherence(void) {
+    if (!ensure_readable()) { record("coherence", 0, "read window 0x%08X unreachable even after reset+halt", g_rdbase); return 1; }
     uint32_t cpuid = 0, first = 0;
     int fails = 0;
 
@@ -673,6 +803,7 @@ static int t_coherence(void) {
 
 // --- sustained verified read.
 static int t_read(void) {
+    if (!ensure_readable()) { record("read", 0, "read window 0x%08X unreachable even after reset+halt", g_rdbase); return 1; }
     struct bwcfg cfg = { .base = g_rdbase, .write = 0, .verify = 1,
                          .target_bytes = g_readmb * 1024ull * 1024ull, .depth = g_depth };
     struct bwres r;
@@ -830,6 +961,24 @@ static int reset_halt_via_swd(void) {
     return halted ? 0 : -3;
 }
 
+// --- reset the target and leave it halted at the reset vector, before its
+// --- firmware has run a single instruction. On a part whose firmware locks down
+// --- debug access (TrustZone secure attribution, DBGMCU, an SPE that shuts the
+// --- port), this is the only way back in - and it is the recovery path pyOCD
+// --- needs before AP discovery when a half-flashed target reboots on a loop.
+static int t_halt(void) {
+    int rc = reset_halt_via_swd();
+    uint32_t dhcsr = 0, csw = 0, stat = 0;
+    mem_read32(DHCSR, &dhcsr);
+    xfer1(DP_CTRLSTAT_R, 0, &stat);
+    xfer1(AP_CSW_R, 0, NULL); xfer1(DP_RDBUFF_R, 0, &csw);
+    g_leave_halted = 1;
+    int pass = rc == 0 && (dhcsr & DHCSR_S_HALT);
+    record("halt", pass, "reset+halt rc %d, DHCSR 0x%08X (%s), CTRL/STAT 0x%08X, CSW 0x%08X",
+           rc, dhcsr, (dhcsr & DHCSR_S_HALT) ? "halted" : "RUNNING", stat, csw);
+    return !pass;
+}
+
 static int t_srst(void) {
     int fails = 0;
     for (int i = 0; i < (g_iters < 10 ? g_iters : 10); i++) {
@@ -850,6 +999,7 @@ static int t_srst(void) {
 // --- is overrun and responses stop matching commands. A host that ignores
 // --- DAP_Info 0xFE gets full throughput and silent corruption.
 static int t_depth(void) {
+    if (!ensure_readable()) { record("depth", 0, "read window 0x%08X unreachable even after reset+halt", g_rdbase); return 1; }
     struct bwres r;
     long clean_errs = 0;
     int over_corrupts = 0;
@@ -861,8 +1011,10 @@ static int t_depth(void) {
         run_bw(&cfg, &r);
         long e = bw_errors(&r);
         clean_errs += e;
-        off += snprintf(per_depth + off, sizeof per_depth - off, "%s%d:%s", d > 1 ? " " : "",
-                        d, e ? "ERR" : "ok");
+        off += snprintf(per_depth + off, sizeof per_depth - off, "%s%d:", d > 1 ? " " : "", d);
+        if (!e) off += snprintf(per_depth + off, sizeof per_depth - off, "ok");
+        else    off += snprintf(per_depth + off, sizeof per_depth - off, "u%ld/a%ld/s%ld/m%ld",
+                                r.usb_err, r.ack_err, r.short_err, r.mismatch);
         if (off >= (int)sizeof per_depth) break;
     }
     // now deliberately exceed it
@@ -888,6 +1040,7 @@ static int t_depth(void) {
 // --- IO_PORT_WRITE_CYCLES was corrected it padded every half period and ran
 // --- slower than requested, which is invisible unless you time it.
 static int t_clock(void) {
+    if (!ensure_readable()) { record("clock", 0, "read window 0x%08X unreachable even after reset+halt", g_rdbase); return 1; }
     static const uint32_t reqs[] = {1000000, 2000000, 4000000, 10000000, 30000000};
     char buf[256]; int off = 0, fails = 0;
     double sat = 0;
@@ -969,20 +1122,43 @@ static int t_churn(void) {
 // --- long verified pull with a hard per-100ms floor. Average bandwidth hides
 // --- stalls; a SystemView capture drops data on the worst bucket, not the mean.
 static int t_soak(void) {
+    if (!ensure_readable()) { record("soak", 0, "read window 0x%08X unreachable even after reset+halt", g_rdbase); return 1; }
     struct bwcfg cfg = { .base = g_rdbase, .verify = 1,
-                         .target_bytes = 64ull << 20, .depth = g_depth };
+                         .target_bytes = g_soak_mb << 20, .depth = g_depth };
     struct bwres r;
     g_golden = calloc(1, WINDOW_BYTES + 4096);
     run_bw(&cfg, &r);
     free(g_golden); g_golden = NULL;
 
-    double kib = bw_kib(&r), floor_kib = g_min_read_kib * 0.55;
+    double kib = bw_kib(&r);
     long errs = bw_errors(&r);
-    int pass = errs == 0 && kib >= g_min_read_kib && r.min_bucket / 1024.0 >= floor_kib;
-    record("soak", pass, "%.0f MiB in %.1f s = %.1f KiB/s, errors %ld, worst 100ms %.0f KiB/s "
-           "(floor %.0f), sd %.1f%%",
-           r.bytes / 1048576.0, r.elapsed, kib, errs, r.min_bucket / 1024.0, floor_kib,
-           100.0 * r.sd_bucket / (r.mean_bucket ? r.mean_bucket : 1));
+
+    // What decides whether a SystemView capture drops data is not the worst
+    // 100 ms window - a floor on every window over three minutes is an assertion
+    // about the host OS scheduler, not about the probe. It is the peak BACKLOG:
+    // run the measured drain rate against a constant producer and track how much
+    // unread data would have piled up in the target's RTT buffer. A stall only
+    // matters if it outlasts the buffer.
+    double backlog = 0, peak = 0, stalled_s = 0;
+    int n = g_nbuckets > 2 ? g_nbuckets - 2 : 0;
+    for (int i = 0; i < n; i++) {
+        double drained = g_bucket[i + 1] * BUCKET_S;
+        double made    = g_soak_produce_kib * 1024.0 * BUCKET_S;
+        backlog += made - drained;
+        if (backlog < 0) backlog = 0;
+        if (backlog > peak) peak = backlog;
+        if (g_bucket[i + 1] < g_soak_produce_kib * 1024.0) stalled_s += BUCKET_S;
+    }
+
+    int pass = errs == 0 && kib >= g_min_read_kib && peak <= g_soak_buffer_kib * 1024.0;
+    record("soak", pass, "%.0f MiB in %.1f s = %.1f KiB/s, errors %ld, sd %.1f%%, worst 100ms "
+           "%.0f KiB/s, maxlat %.0f ms; vs a %.0f KiB/s producer: peak backlog %.1f KiB "
+           "(buffer %.0f KiB), behind %.1f%% of the time",
+           r.bytes / 1048576.0, r.elapsed, kib, errs,
+           100.0 * r.sd_bucket / (r.mean_bucket ? r.mean_bucket : 1),
+           r.min_bucket / 1024.0, r.max_latency * 1000.0,
+           g_soak_produce_kib, peak / 1024.0, g_soak_buffer_kib,
+           n ? 100.0 * stalled_s / (n * BUCKET_S) : 0.0);
     return !pass;
 }
 
@@ -990,7 +1166,7 @@ static int t_soak(void) {
 static void usage(void) {
     fprintf(stderr,
         "usage: daptest [options] <case>...\n"
-        "cases: transport coherence read write resetloop srst depth clock fault churn soak all\n"
+        "cases: transport coherence read write resetloop srst halt depth clock fault churn soak all\n"
         "options:\n"
         "  --clock HZ     SWD clock request (default 10000000)\n"
         "  --rdbase HEX   static read window base (default 0x08000000)\n"
@@ -998,6 +1174,9 @@ static void usage(void) {
         "  --mb N         MiB per read/write bandwidth case (default 10)\n"
         "  --depth N      pipeline depth, clamped to DAP_PACKET_COUNT (default 8)\n"
         "  --iters N      iterations for resetloop/srst/churn (default 20)\n"
+        "  --soak-mb N    MiB for the soak case (default 64)\n"
+        "  --produce K    assumed RTT producer rate in KiB/s for the soak (default 160)\n"
+        "  --buffer K     assumed RTT buffer size in KiB for the soak (default 64)\n"
         "  --min-read K   read bandwidth floor in KiB/s (default 280)\n"
         "  --min-write K  write bandwidth floor in KiB/s (default 280)\n"
         "  -v             verbose\n");
@@ -1009,11 +1188,14 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if      (!strcmp(a, "--clock")     && i + 1 < argc) g_clock  = strtoul(argv[++i], NULL, 0);
-        else if (!strcmp(a, "--rdbase")    && i + 1 < argc) g_rdbase = strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--rdbase")    && i + 1 < argc) { g_rdbase = strtoul(argv[++i], NULL, 0); g_rdbase_fixed = 1; }
         else if (!strcmp(a, "--wrbase")    && i + 1 < argc) g_wrbase = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(a, "--mb")        && i + 1 < argc) g_readmb = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(a, "--depth")     && i + 1 < argc) g_depth  = atoi(argv[++i]);
         else if (!strcmp(a, "--iters")     && i + 1 < argc) g_iters  = atoi(argv[++i]);
+        else if (!strcmp(a, "--soak-mb")   && i + 1 < argc) g_soak_mb = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--produce")   && i + 1 < argc) g_soak_produce_kib = atof(argv[++i]);
+        else if (!strcmp(a, "--buffer")    && i + 1 < argc) g_soak_buffer_kib  = atof(argv[++i]);
         else if (!strcmp(a, "--min-read")  && i + 1 < argc) g_min_read_kib  = atof(argv[++i]);
         else if (!strcmp(a, "--min-write") && i + 1 < argc) g_min_write_kib = atof(argv[++i]);
         else if (!strcmp(a, "-v")) g_verbose = 1;
@@ -1051,12 +1233,25 @@ int main(int argc, char **argv) {
     if (!swd_connect(g_clock, &idcode)) die("SWD connect failed - is a target attached and powered?");
     uint32_t cpuid = 0;
     mem_read32(0xE000ED00, &cpuid);
+    bool window_ok = pick_read_window();
 
     printf("probe   iface %d ep %02x/%02x, DAP_PACKET_SIZE %u, DAP_PACKET_COUNT %u\n",
            g_iface, g_ep_out, g_ep_in, g_pkt_size, g_pkt_count);
     printf("target  DPIDR 0x%08X, CPUID 0x%08X, SWD clock request %u Hz\n", idcode, cpuid, g_clock);
-    printf("geom    %u words/block, %u blocks/KiB page, %u bytes covered per page\n\n",
+    printf("access  AP0 %s, read window 0x%08X %s\n",
+           g_csw_nonsec == 0 ? "secure" : (g_csw_nonsec == 1 ? "non-secure" : "UNCONFIGURED"),
+           g_rdbase, window_ok ? "readable" : "NOT READABLE");
+    printf("geom    %u words/block, %u blocks/KiB page, %u bytes covered per page\n",
            g_wpb, g_chunks_per_page, g_page_read);
+    if (g_verbose) {
+        uint32_t stat = 0, csw = 0, w = 0;
+        xfer1(DP_CTRLSTAT_R, 0, &stat);
+        xfer1(AP_CSW_R, 0, NULL); xfer1(DP_RDBUFF_R, 0, &csw);
+        int ack = mem_read32(g_rdbase, &w);
+        printf("dp      CTRL/STAT 0x%08X, AP CSW 0x%08X, word at 0x%08X: ack %d value 0x%08X\n",
+               stat, csw, g_rdbase, ack, w);
+    }
+    printf("\n");
 
     int failed = 0;
     for (int i = 0; i < ncases; i++) {
@@ -1068,6 +1263,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(c, "write"))     rc = t_write();
         else if (!strcmp(c, "resetloop")) rc = t_resetloop();
         else if (!strcmp(c, "srst"))      rc = t_srst();
+        else if (!strcmp(c, "halt"))      rc = t_halt();
         else if (!strcmp(c, "depth"))     rc = t_depth();
         else if (!strcmp(c, "clock"))     rc = t_clock();
         else if (!strcmp(c, "fault"))     rc = t_fault();
@@ -1082,7 +1278,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < g_ncase; i++)
         if (!g_case[i].pass) printf("  FAILED %s: %s\n", g_case[i].name, g_case[i].note);
 
-    cm_release_debug();
+    if (!g_leave_halted) {
+        cm_release_debug();       // let the target free-run again
+    }
     dap_disconnect();
     libusb_release_interface(g_h, g_iface);
     libusb_close(g_h);

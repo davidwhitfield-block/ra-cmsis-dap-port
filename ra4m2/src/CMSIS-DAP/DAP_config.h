@@ -55,9 +55,23 @@ This information includes:
 #include "bsp_pin_cfg.h"
 
 extern bsp_leds_t g_bsp_leds;
-#define LED_INDEX_RUNNING 0      // Red: our only status LED
-#define LED_INDEX_VCOM 1   // Green: EK-RA4M2 LED2
-#define LED_INDEX_CONNECTED 2 // Red: EK-RA4M2 LED3
+
+/* The X2C automation board has exactly one LED: DS11 on P111 (JLINK_OB_LED_L),
+ * wired 3V3 -> DS11 -> R53 -> P111, so it is ACTIVE LOW - the MCU sinks the
+ * current. It is owned by the USB status indicator in dap_thread_entry.c
+ * (slow blink until enumerated, solid once configured), so the CMSIS-DAP
+ * connect/running indicators are disabled rather than fighting over it.
+ *
+ * A negative index means "no LED"; every user must bounds-check before
+ * indexing g_bsp_leds.p_leds[], which has led_count (1) entries. */
+#define LED_INDEX_STATUS     0    // DS11 - USB status, active low
+#define LED_INDEX_RUNNING    (-1) // no dedicated "target running" LED
+#define LED_INDEX_VCOM       (-1) // no dedicated VCOM activity LED
+#define LED_INDEX_CONNECTED  (-1) // no dedicated "debugger connected" LED
+
+/* DS11 sinks through R53, so LOW lights it. */
+#define LED_STATUS_ON_LEVEL   BSP_IO_LEVEL_LOW
+#define LED_STATUS_OFF_LEVEL  BSP_IO_LEVEL_HIGH
 
 /// Processor Clock of the Cortex-M MCU used in the Debug Unit.
 /// This value is used to calculate the SWD/JTAG clock speed.
@@ -528,7 +542,7 @@ It is recommended to provide the following LEDs for status indication:
 __STATIC_INLINE void LED_CONNECTED_OUT(uint32_t bit)
 {
   int32_t ledindex = LED_INDEX_CONNECTED;
-  if (ledindex < g_bsp_leds.led_count)
+  if (ledindex >= 0 && ledindex < g_bsp_leds.led_count)
   {
     R_BSP_PinWrite((bsp_io_port_pin_t)g_bsp_leds.p_leds[ledindex], bit ? BSP_IO_LEVEL_HIGH : BSP_IO_LEVEL_LOW);
   }

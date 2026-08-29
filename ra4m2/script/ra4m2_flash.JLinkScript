@@ -1,0 +1,62 @@
+/*
+ * J-Link script file used when programming the RA4M2 over SWD.
+ *
+ * Out of reset the RA4M2 runs from MOCO with SCKDIVCR = 0x22022222, i.e.
+ * ICK = FCK = /4, which puts FCLK at roughly 2 MHz. The RA4M2 flash sequencer
+ * requires FCLK >= 4 MHz for code-flash program/erase, so J-Link can program
+ * the option-setting area (which tolerates the slow clock) but fails the
+ * code-flash erase with "Failed to erase sectors".
+ *
+ * Both hooks below take ICLK and FCLK to MOCO/1 (~8 MHz) by writing
+ * SCKDIVCR (R_SYSTEM + 0x20) with ICK and FCK set to /1, leaving the
+ * peripheral dividers at their reset /4. SetupTarget() covers the initial
+ * connect; ResetTarget() covers the implicit reset & halt that J-Link performs
+ * before every erase/loadfile, which would otherwise restore the /4 reset
+ * dividers. Nothing else about the clock tree is touched -- the application
+ * reconfigures the clocks itself when it starts.
+ *
+ * Note: the J-Link script language is a restricted C subset -- no preprocessor
+ * directives, so the register addresses appear as literals below.
+ */
+
+void PrepareFlash(void)
+{
+    JLINK_MEM_WriteU16(0x4001E3FE, 0xA501);       // PRCR: unlock clock generation registers
+    JLINK_MEM_WriteU32(0x4001E020, 0x00022222);   // SCKDIVCR: ICK = /1, FCK = /1
+    JLINK_MEM_WriteU16(0x4001E3FE, 0xA500);       // PRCR: re-lock
+
+    // FMEPROT (R_FACI_HP + 0x44): KEY = 0xD9, CEPROT = 0 -> permit code-flash P/E
+    // mode entry. The register is write-only (always reads back 0) and only
+    // accepts secure accesses, which is what J-Link uses here.
+    JLINK_MEM_WriteU16(0x407FE044, 0xD900);
+
+    // FPCKAR (R_FACI_HP + 0xE4): KEY = 0x1E, PCKA = FCLK in MHz. The sequencer
+    // rejects program/erase with an erase error if this does not match FCLK,
+    // and it reads back as 0x00F4 (244 MHz) on this target out of reset.
+    JLINK_MEM_WriteU16(0x407FE0E4, 0x1E08);       // 8 MHz (MOCO/1)
+
+    // Code-flash block protection is active out of reset and makes every
+    // code-flash erase fail with FSTATR.FLWEERR ("erase error" as reported by
+    // J-Link). Cancel it for both the non-secure and secure block sets.
+    // Each register takes its own key in bits 15:8 and the cancel bit in bit 0.
+    JLINK_MEM_WriteU16(0x407FE078, 0x7801);       // FBPROT0: KEY = 0x78, BPCN0 = 1
+    JLINK_MEM_WriteU16(0x407FE07C, 0xB101);       // FBPROT1: KEY = 0xB1, BPCN1 = 1
+}
+
+int SetupTarget(void)
+{
+    PrepareFlash();
+    return 0;
+}
+
+int ResetTarget(void)
+{
+    JLINK_MEM_WriteU32(0xE000EDFC, 0x00000001);   // DEMCR.VC_CORERESET: halt out of reset
+    JLINK_MEM_WriteU32(0xE000ED0C, 0x05FA0004);   // AIRCR.SYSRESETREQ
+    JLINK_SYS_Sleep(20);
+    JLINK_MEM_WriteU32(0xE000EDF0, 0xA05F0003);   // DHCSR: DBGKEY | C_HALT | C_DEBUGEN
+    JLINK_MEM_WriteU32(0xE000EDFC, 0x00000000);   // DEMCR: clear VC_CORERESET
+
+    PrepareFlash();
+    return 0;
+}

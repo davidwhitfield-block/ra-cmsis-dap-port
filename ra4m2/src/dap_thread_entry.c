@@ -14,6 +14,14 @@
 #define UART_TXING 0x1
 #define UART_RXING 0x2
 
+/* Status LED (DS11 on P111, JLINK_OB_LED_L, active low).
+ *
+ * Not enumerated on a USB host -> slow blink, so a board that never comes up
+ * is obvious at a glance. Enumerated and configured -> solid on.
+ *
+ * Half-period of the "not enumerated" blink, in RTOS ticks. */
+#define STATUS_LED_BLINK_TICKS pdMS_TO_TICKS(500)
+
 /* external variables*/
 extern uint8_t g_apl_configuration[];
 extern uint8_t g_apl_report[];
@@ -25,6 +33,36 @@ void SWO_TransferComplete(void);
 
 /* Local Module Variables */
 static bool b_usb_configured = false;
+
+/*******************************************************************************************************************//**
+ * @brief Drive the board status LED from the USB enumeration state.
+ *
+ * Solid while the device is configured on a host, slow blink otherwise. Called
+ * from the DAP thread loop, which turns over at least once per tick, so the
+ * blink phase is derived from the tick count rather than a local counter.
+ **********************************************************************************************************************/
+static void status_led_update (void)
+{
+    if (LED_INDEX_STATUS >= g_bsp_leds.led_count)
+    {
+        return;                        /* board has no status LED */
+    }
+
+    bsp_io_level_t level;
+
+    if (b_usb_configured)
+    {
+        level = LED_STATUS_ON_LEVEL;
+    }
+    else
+    {
+        /* Alternate every STATUS_LED_BLINK_TICKS. */
+        bool on = ((xTaskGetTickCount() / STATUS_LED_BLINK_TICKS) & 1U) != 0U;
+        level = on ? LED_STATUS_ON_LEVEL : LED_STATUS_OFF_LEVEL;
+    }
+
+    R_BSP_PinWrite((bsp_io_port_pin_t) g_bsp_leds.p_leds[LED_INDEX_STATUS], level);
+}
 static usb_pcdc_linecoding_t g_line_coding;
 
 static volatile uint16_t USB_RequestIndexI; // Request Index In
@@ -457,8 +495,7 @@ void dap_thread_entry(void *pvParameters)
         ProcessUsbSwoQueue();
         ProcessUartSwoQueue();
 
-        R_BSP_PinWrite((bsp_io_port_pin_t)g_bsp_leds.p_leds[LED_INDEX_VCOM],
-                       g_uart_activity != 0 ? BSP_IO_LEVEL_HIGH : BSP_IO_LEVEL_LOW);
+        status_led_update();
 
         xSemaphoreTake(g_sem_DAP_Thread, 1);
     }

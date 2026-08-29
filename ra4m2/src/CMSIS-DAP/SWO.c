@@ -25,6 +25,26 @@
  *
  *---------------------------------------------------------------------------*/
 
+/*---------------------------------------------------------------------------
+ * LOCAL CHANGES - this file reads as untouched vendor code but is not.
+ *
+ * The "$Revision: V2.0.1" above is ARM's and is not bumped on edit. Exactly two
+ * one-line changes were made against the CMSIS 5.9.0 Pack import; both sites
+ * carry their own LOCAL CHANGE comment below, because a re-vendor from a newer
+ * Pack would otherwise silently revert them:
+ *
+ *   1. USB_BLOCK_SIZE  512 -> 64      (endpoint wMaxPacketSize)
+ *   2. an `if (TransferBusy)` guard around TraceIndexO += TransferSize
+ *      in SWO_TransferComplete()
+ *
+ * The file is live only because DAP_config.h sets SWO_UART = 1 and SWO_STREAM = 1
+ * (both 0 in the template). See ./README.md.
+ *
+ * On this board the SWO data path is: target SWO -> P100 (SCI0 RXD) -> the
+ * ARM_USART Driver_USART0 shim in ../swo_thread_entry.c -> this file's capture
+ * ring -> a queued request to the DAP thread -> bulk IN on swo_pipe.
+ *---------------------------------------------------------------------------*/
+
 #include "DAP_config.h"
 #include "DAP.h"
 #if (SWO_UART != 0)
@@ -60,6 +80,19 @@ static uint8_t USART_Ready = 0U;
 
 #define SWO_STREAM_TIMEOUT      50U     /* Stream timeout in ms */
 
+/* LOCAL CHANGE: 512 -> 64.
+ *
+ * This must equal the wMaxPacketSize of the endpoint SWO actually streams on -
+ * EP6 IN bulk, declared USB_MXPS_BULK_FULL in ../r_usb_pcdc_pvnd_descriptor.c.
+ * 64 is also the full-speed bulk maximum, so it cannot be raised on this device;
+ * 512 is the HIGH-speed figure and the RA4M2's USBFS is full-speed only.
+ *
+ * It is not just a buffer size. The streaming path uses it as a power-of-two mask
+ * (`index & (USB_BLOCK_SIZE - 1U)`, `count &= ~(USB_BLOCK_SIZE - 1U)`) to align
+ * transfers to packet boundaries, so a value larger than the endpoint would make
+ * SWO_Thread() hand R_USB_PipeWrite() lengths the pipe cannot send in one packet
+ * and mis-track how much has been sent. Keep it a power of two, and keep it equal
+ * to the descriptor. */
 #define USB_BLOCK_SIZE          64U    /* USB Block Size */
 #define TRACE_BLOCK_SIZE        64U     /* Trace Block Size (2^n: 32...512) */
 
@@ -735,11 +768,26 @@ uint32_t SWO_Data (const uint8_t *request, uint8_t *response) {
 #if (SWO_STREAM != 0)
 
 // SWO Data Transfer complete callback
+//
+// Called from ../dap_thread_entry.c's USB_STATUS_WRITE_COMPLETE handler when a
+// write on swo_pipe finishes.
 void SWO_TransferComplete (void) {
+  /* LOCAL CHANGE: the `if (TransferBusy)` guard. Upstream advances TraceIndexO
+   * unconditionally.
+   *
+   * TraceIndexO is the count of bytes handed to USB; GetTraceCount() computes
+   * TraceIndexI - TraceIndexO. Advancing it on a completion that arrives with no
+   * transfer outstanding makes that difference underflow to a huge unsigned value,
+   * and the trace stream never recovers.
+   *
+   * That can happen here because completions are not perfectly paired with
+   * starts: SWO_AbortTransfer() stops the pipe (via the {NULL, 0} sentinel to the
+   * DAP thread) and clears TransferBusy, but a write already in flight can still
+   * report completion afterwards. The guard makes the late callback a no-op. */
   if (TransferBusy) {
     TraceIndexO += TransferSize;
   }
-  
+
   TransferBusy = 0U;
   ResumeTrace();
   osThreadFlagsSet(SWO_ThreadId, 1U);

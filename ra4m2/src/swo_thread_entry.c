@@ -1,3 +1,36 @@
+/***********************************************************************************************************************
+ * swo_thread_entry.c - the SWO trace path, and the shims that make ARM's SWO.c
+ * run on FSP + FreeRTOS.
+ *
+ * SWO on this board is plain UART trace, not Manchester: the target's SWO pin
+ * drives P100 = SCI0 RXD through level shifter U16, and SCI0 receives it as
+ * asynchronous 8N1 at whatever baud the host asked for.
+ *
+ * The data path, end to end:
+ *
+ *   target SWO -> P100 (SCI0 RXD)
+ *     -> swo_uart_callback()          per-character ISR, fills g_swo_uartrx_buf
+ *     -> ProcessUartSwoQueue()        called from the DAP thread's main loop;
+ *                                     copies into the buffer SWO.c asked for
+ *     -> CMSIS-DAP/SWO.c              framing, trace status, flow control
+ *     -> SWO_QueueTransfer()          posts to g_queue_swo_usb
+ *     -> ProcessUsbSwoQueue()         in dap_thread_entry.c, issues the write
+ *     -> bulk IN on swo_pipe
+ *
+ * Note SWO capture runs in an ISR but everything downstream of it runs on the DAP
+ * thread, not this one. This file's own thread exists only to host ARM's
+ * SWO_Thread() loop.
+ *
+ * Three distinct things live here, and it is worth not confusing them:
+ *   1. the capture ring and its ISR (g_swo_uartrx_buf, swo_uart_callback);
+ *   2. a two-function CMSIS-RTOS2 emulation over FreeRTOS semaphores
+ *      (osThreadFlagsWait / osThreadFlagsSet), which is all of CMSIS-RTOS2 that
+ *      SWO.c actually uses - see CMSIS-DAP/cmsis_os2.h;
+ *   3. a CMSIS ARM_DRIVER_USART shim over FSP's R_SCI_UART, at the bottom of the
+ *      file, exposing exactly the six entry points SWO.c calls and NULL for the
+ *      rest.
+ **********************************************************************************************************************/
+
 #include "swo_thread.h"
 #include "common_utils.h"
 #include "usb_composite.h"
@@ -5,15 +38,49 @@
 #include "CMSIS-DAP/cmsis_os2.h"
 #include "CMSIS-DAP/DAP.h"
 
+/* Diagnostic counters. Never read by the firmware - they exist to be inspected
+ * from a debugger attached to the probe when SWO drops data, and they are the
+ * only record of an overflow. QUEUE_OVERFLOW means the capture ring filled
+ * (consumer too slow); HW_FIFO_OVERFLOW means SCI0's own FIFO overran (ISR too
+ * slow, or baud too high). */
 static SWO_UART_STAT swo_uart_stat = {0};
 static SWO_USB_STAT swo_usb_stat = {0};
 
+/* State of the one outstanding ARM_USART_Receive() request. SWO.c asks for `num`
+ * bytes into `data` and is told ARM_USART_EVENT_RECEIVE_COMPLETE when `recvd`
+ * reaches it. Only one request can be outstanding, which the CMSIS USART contract
+ * already requires. */
 static ARM_USART_SignalEvent_t ARM_USART_Initialize_cb_event = NULL;
 static uint8_t *ARM_USART_Receive_data = NULL;
 static uint32_t ARM_USART_Receive_recvd = 0x0;
 static uint32_t ARM_USART_Receive_num = 0x0;
+
+/* Not a thread handle - an arbitrary sentinel.
+ *
+ * cmsis_os2.h defines osThreadId_t as a plain int, and the only use of this value
+ * is the `thread_id == SWO_ThreadId` equality test in osThreadFlagsSet() below,
+ * which exists to reject calls that this two-function emulation does not
+ * implement. SWO.c is the sole caller and always passes this variable back, so
+ * any non-colliding constant works; 0x0AFEBABE is recognisable in a register dump
+ * and will never be a real FreeRTOS TaskHandle_t. Do NOT pass it to any FreeRTOS
+ * API. */
 osThreadId_t SWO_ThreadId = 0x0AFEBABE;
 
+/* Capture ring, written by the SCI0 ISR and drained by the DAP thread.
+ *
+ * MUST be a power of two: both indices are wrapped with `&= INDEX_MASK` rather
+ * than a modulo or a compare, so any other size silently corrupts the ring. 16 KiB
+ * is the largest that fits comfortably alongside the 16 KiB of DAP packet buffers
+ * on a 128 KB part, and it is what bounds how long the consumer may be stalled
+ * before trace is lost: at the 2.5 MHz SWO_UART_MAX_BAUDRATE ceiling (~250 KB/s)
+ * that is about 65 ms of slack.
+ *
+ * Single producer (ISR), single consumer (DAP thread), so no lock is needed - but
+ * only because each index is written by exactly one side. UartIndexI is the ISR's
+ * alone, UartIndexO the consumer's; `volatile` is what keeps each side re-reading
+ * the other's. The ring deliberately keeps one slot empty (full is
+ * `((UartIndexI + 1) & INDEX_MASK) == UartIndexO`) so the two indices are never
+ * equal except when empty. */
 #define UART_CAPTURE_BUFFER_SIZE 16384
 #define INDEX_MASK (UART_CAPTURE_BUFFER_SIZE - 1)
 static uint8_t g_swo_uartrx_buf[UART_CAPTURE_BUFFER_SIZE] = {};
@@ -60,6 +127,11 @@ void ProcessUartSwoQueue(void)
             }
             if (ARM_USART_Receive_remain == 0x0)
             {
+                /* Order matters: clear the request state BEFORE signalling
+                 * completion. The callback runs synchronously on this thread and
+                 * SWO.c posts the next ARM_USART_Receive() from inside it, so
+                 * zeroing these afterwards would wipe the request that was just
+                 * made and SWO would stall with no reader posted. */
                 ARM_USART_Receive_recvd = 0x0;
                 ARM_USART_Receive_num = 0x0;
                 ARM_USART_Receive_data = NULL;
@@ -236,6 +308,18 @@ void SWO_QueueTransfer(uint8_t *buf, uint32_t num)
 }
 
 // SWO Data Abort : Abort the SWO Transfer of SWO Data to the PC
+//
+// {buf = NULL, num = 0} is the agreed sentinel that tells ProcessUsbSwoQueue() in
+// dap_thread_entry.c to call R_USB_PipeStop() instead of R_USB_PipeWrite(). There
+// is no separate abort queue or flag.
+//
+// Note the asymmetry with SWO_QueueTransfer(): this does NOT give g_sem_DAP_Thread,
+// so the abort is not acted on until the DAP thread next wakes for some other
+// reason - at worst one tick (1 ms) later, because the thread's park has a 1-tick
+// timeout. Harmless, since an abort has no deadline, but it does mean the pipe can
+// still be busy briefly after this returns. That is exactly why
+// SWO_TransferComplete() in CMSIS-DAP/SWO.c carries an `if (TransferBusy)` guard:
+// a write already in flight when the abort lands will still report completion.
 void SWO_AbortTransfer(void)
 {
     SWO_USB_REQUEST swo_usb_request;
@@ -463,6 +547,17 @@ static int32_t ARM_USART_Control(uint32_t control, uint32_t arg)
   **********************************************************************************************************************/
 static ARM_USART_STATUS ARM_USART_GetStatus(void)
 {
+    /* Constant, not sampled. SWO.c only ever consults rx_busy, and in this design
+     * reception is always "in progress": SCI0 is left open and the ISR fills the
+     * capture ring continuously, independent of whether SWO.c has a request
+     * outstanding. Reporting rx_busy = 1 unconditionally is therefore accurate for
+     * the one field that matters.
+     *
+     * The error flags are hardwired to 0 rather than latched, but no information
+     * is lost - every error is reported the moment it happens, through
+     * ARM_USART_Initialize_cb_event() in swo_uart_callback(), and overflows are
+     * additionally counted in swo_uart_stat. A caller that polled this struct for
+     * errors would see none; SWO.c does not. */
     ARM_USART_STATUS status;
     status.tx_busy = 0;
     status.rx_busy = 1;
@@ -476,6 +571,27 @@ static ARM_USART_STATUS ARM_USART_GetStatus(void)
 
 // End USART Interface
 
+/* The CMSIS driver vtable SWO.c binds to.
+ *
+ * The name is load-bearing: DAP_config.h sets SWO_UART_DRIVER = 0, and SWO.c
+ * expands that to `Driver_USART0`. Renaming this breaks the link with an
+ * undefined-reference that gives no hint of the cause.
+ *
+ * NULL entries are the ARM_DRIVER_USART members SWO.c never calls, in declaration
+ * order (see CMSIS-DAP/Driver_USART.h):
+ *
+ *   [0]  GetVersion            [1]  GetCapabilities
+ *   [2]  Initialize            [3]  Uninitialize
+ *   [4]  PowerControl          [5]  Send            <- NULL, RX only: this is a
+ *   [6]  Receive               [7]  Transfer           trace input, never a
+ *   [8]  GetTxCount            [9]  GetRxCount         transmitter
+ *   [10] Control               [11] GetStatus
+ *   [12] SetModemControl       [13] GetModemStatus  <- NULL, no modem lines
+ *
+ * A NULL here is a null-pointer call, not a graceful error, so anything routed
+ * through this shim beyond SWO.c's needs must fill in the slot it uses first. The
+ * `extern` line above the definition is redundant but harmless; it is what makes
+ * the symbol non-static. */
 extern ARM_DRIVER_USART Driver_USART0;
 ARM_DRIVER_USART Driver_USART0 = {
     NULL,

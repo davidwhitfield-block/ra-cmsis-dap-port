@@ -25,6 +25,23 @@
  *
  *---------------------------------------------------------------------------*/
 
+/*---------------------------------------------------------------------------
+ * LOCAL CHANGES - this file is a TEMPLATE and has been substantially rewritten
+ * for the R7FA4M2AB3CNE on the X2C Automation board.
+ *
+ * The "$Revision: V2.1.0" above is ARM's upstream revision and is NOT bumped when
+ * this file is edited. Do not read it as evidence the file is stock. Roughly
+ * +135/-40 lines against the CMSIS 5.9.0 Pack import; see ./README.md for the
+ * per-file record and how to regenerate the diff.
+ *
+ * Four constants below are MEASURED values, not defaults: CPU_CLOCK,
+ * IO_PORT_WRITE_CYCLES, DAP_PACKET_SIZE and DAP_PACKET_COUNT. Reverting any of
+ * them to the template value silently costs throughput or mis-scales the SWD
+ * clock, so each carries its derivation inline. The pin-access block and the LED
+ * block are board-specific rewrites. DAP_JTAG is 0 because JTAG is physically
+ * impossible here, not as a preference.
+ *---------------------------------------------------------------------------*/
+
 #ifndef __DAP_CONFIG_H__
 #define __DAP_CONFIG_H__
 
@@ -54,6 +71,11 @@ This information includes:
 #include "r_ioport_api.h"
 #include "bsp_pin_cfg.h"
 
+/* FSP declares this `const bsp_leds_t g_bsp_leds` in bsp_pin_cfg.h / the board
+ * file. Dropping the const here is a type mismatch the linker does not diagnose,
+ * and it is harmless only because every user below - and status_led_update() in
+ * ../dap_thread_entry.c, which repeats the same declaration - reads it and never
+ * writes it. Correcting it is a code change, so it is recorded rather than made. */
 extern bsp_leds_t g_bsp_leds;
 
 /* The X2C automation board has exactly one LED: DS11 on P111 (JLINK_OB_LED_L),
@@ -119,6 +141,18 @@ extern bsp_leds_t g_bsp_leds;
 
 /// Indicate that JTAG communication mode is available at the Debug Port.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
+///
+/// 0, and it cannot be anything else on this board. The MCU-side JTAG pins map to
+/// P000 (TDI), P001 (TDO) and P002 (nTRST), all of which are no-connects on the
+/// X2C Automation schematic, and P110 - the pin the schematic labels DEBUG0 TDI -
+/// is likewise NC. There is no target-side TDI/TDO wiring and no level-shifter
+/// channel for one. Setting this to 1 would advertise a capability in DAP_Info
+/// that the hardware cannot deliver; a host that then selected JTAG would fail in
+/// a confusing way rather than falling back to SWD.
+///
+/// Consequences worth knowing: JTAG_DP.c compiles to nothing, PIN_TDI_OUT() and
+/// friends below are dead code kept only so the file matches the template, and
+/// DAP_JTAG_DEV_CNT is inert.
 #define DAP_JTAG                0               ///< JTAG Mode: 1 = available, 0 = not available.
 
 /// Configure maximum number of JTAG devices on the scan chain connected to the Debug Access Port.
@@ -170,7 +204,15 @@ extern bsp_leds_t g_bsp_leds;
 #define SWO_UART_DRIVER         0               ///< USART Driver instance number (Driver_USART#).
 
 /// Maximum SWO UART Baudrate.
-#define SWO_UART_MAX_BAUDRATE   2500000U       ///< SWO UART Maximum Baudrate in Hz.                                 
+///
+/// 2.5 MHz, down from the template's 10 MHz. Unlike the other tuned constants in
+/// this file there is NO recorded rationale - not in the file, not in the commit
+/// that changed it - and it has not been re-derived here. Two plausible ceilings
+/// bound it, neither confirmed: SCI0's own divider off PCLKA, and the fact that
+/// SWO lands on a 64-byte full-speed bulk endpoint (see SWO.c's USB_BLOCK_SIZE),
+/// which cannot carry 10 Mbit/s of trace regardless. Treat the number as
+/// load-bearing but unexplained; measure before raising it.
+#define SWO_UART_MAX_BAUDRATE   2500000U       ///< SWO UART Maximum Baudrate in Hz.
 /// Indicate that Manchester Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
 #define SWO_MANCHESTER          0               ///< SWO Manchester:  1 = available, 0 = not available.
@@ -182,6 +224,16 @@ extern bsp_leds_t g_bsp_leds;
 #define SWO_STREAM              1               ///< SWO Streaming Trace: 1 = available, 0 = not available.
 
 /// Clock frequency of the Test Domain Timer. Timer value is returned with \ref TIMESTAMP_GET.
+///
+/// STALE - this is the template's 100 MHz, while ICLK (and therefore DWT->CYCCNT,
+/// which TIMESTAMP_GET() returns) actually runs at CPU_CLOCK = 96 MHz. Every
+/// timestamp the probe reports is scaled ~4.2% wrong.
+///
+/// It matters less than it looks, because the timer is not running at all: see
+/// TIMESTAMP_GET() below. Fixing this properly means enabling CYCCNT *and*
+/// changing this to 96000000U - a code change needing a rebuild and reflash to
+/// validate, so it is documented rather than made. Changing the constant alone
+/// would only make a dead counter's units more convincing.
 #define TIMESTAMP_CLOCK         100000000U      ///< Timestamp clock in Hz (0 = timestamps not supported).
 
 /// Indicate that UART Communication Port is available.
@@ -346,6 +398,22 @@ TDO: Test Data Output        |                      | Input
 nTRST: Test Reset (optional) |                      | Output Open Drain with pull-up resistor
 nRESET: Device Reset         | nRESET: Device Reset | Output Open Drain with pull-up resistor
 
+The table above is ARM's generic recommendation. On this board it is wrong in two
+places, deliberately:
+
+ - nRESET (P112) is configured CMOS PUSH-PULL, not open drain. Open drain assumes
+   a pull-up on the target side; there is none on the 3.3 V side of this link, so
+   an open-drain output would leave the line floating on release and the target
+   would come out of reset at random or not at all. Commit ac60203 changed it.
+   Consequence: never strap this net to a hard level on the target.
+ - The whole JTAG half of the table is unreachable. TDI/TDO/nTRST map to
+   P000/P001/P002, all no-connects, and DAP_JTAG is 0. See DAP_JTAG above.
+
+All four target-side signals (SWDIO, SWCLK, nRESET, SWO) pass through level
+shifter U16, a TXB0104PWR. Its output-enable net, SPE_JLINK_LEVEL_SHIFTER_EN,
+does not reach any MCU pin, so firmware cannot turn the shifter on or off - it is
+board-controlled. That is why PORT_OFF() below cannot actually isolate the target.
+
 
 DAP Hardware I/O Pin Access Functions
 -------------------------------------
@@ -365,10 +433,23 @@ of the same I/O port. The following SWDIO I/O Pin functions are provided:
 
 // Configure DAP I/O pins ------------------------------
 
+/* The three setup hooks below (and DAP_SETUP() at the end of the file) are
+ * deliberately empty. Pin configuration is done once at boot by FSP, from
+ * g_bsp_pin_cfg in ra_gen/, which brings SWDIO/SWCLK/nRESET up as GPIO with
+ * PMR = 0 and nRESET driven high - exactly the state these functions would
+ * otherwise establish, and the state the fast PCNTR macros below depend on.
+ * Nothing here touches PFS, so anything that reconfigured these pins at runtime
+ * would have to put them back.
+ *
+ * Leaving them empty rather than deleting them keeps the file matching ARM's
+ * template, so a future re-vendor diffs cleanly. */
+
 /** Setup JTAG I/O pins: TCK, TMS, TDI, TDO, nTRST, and nRESET.
 Configures the DAP Hardware I/O pins for JTAG mode:
  - TCK, TMS, TDI, nTRST, nRESET to output mode and set to high level.
  - TDO to input mode.
+
+\note No-op, and doubly so: DAP_JTAG is 0, so nothing calls this.
 */
 __STATIC_INLINE void PORT_JTAG_SETUP (void) {
   ;
@@ -378,6 +459,8 @@ __STATIC_INLINE void PORT_JTAG_SETUP (void) {
 Configures the DAP Hardware I/O pins for Serial Wire Debug (SWD) mode:
  - SWCLK, SWDIO, nRESET to output mode and set to default high level.
  - TDI, nTRST to HighZ mode (pins are unused in SWD mode).
+
+\note No-op; FSP's boot-time pin config already leaves the pins in this state.
 */
 __STATIC_INLINE void PORT_SWD_SETUP (void) {
   ;
@@ -386,6 +469,13 @@ __STATIC_INLINE void PORT_SWD_SETUP (void) {
 /** Disable JTAG/SWD I/O Pins.
 Disables the DAP Hardware I/O pins which configures:
  - TCK/SWCLK, TMS/SWDIO, TDI, TDO, nTRST, nRESET to High-Z mode.
+
+\note No-op, and it could not fully do its job even if implemented: the pins sit
+      behind level shifter U16, whose output enable is not wired to the MCU. So
+      the probe cannot electrically release the target's SWD lines. Practically
+      this means DAP_Disconnect leaves SWCLK/SWDIO driven at whatever level the
+      last transfer left them - fine for a target being debugged, but do not rely
+      on disconnecting to hand the bus to a second debugger.
 */
 __STATIC_INLINE void PORT_OFF (void) {
   ;
@@ -520,6 +610,20 @@ __STATIC_FORCEINLINE void     PIN_SWDIO_OUT_DISABLE (void) {
 }
 
 
+/* TDI / TDO / nTRST ------------------------------------------------------------
+ *
+ * Dead code on this board, kept for template parity. DAP_JTAG is 0, so JTAG_DP.c
+ * compiles away and nothing calls PIN_TDI_OUT() or PIN_nTRST_OUT(); the three
+ * _IN() readers survive only because DAP_SWJ_Pins() reports all pins regardless
+ * of mode.
+ *
+ * PIN_CMSIS_DAP_TDI / _TDO / _NTRST resolve to P000 / P001 / P002, which are
+ * no-connects on the X2C Automation schematic. So these reads return whatever a
+ * floating input happens to sample. They still go through R_BSP_PinRead() rather
+ * than the fast PCNTR macros above because they are on port 0, not port 1, and
+ * because they are not on any hot path.
+ */
+
 // TDI Pin I/O ---------------------------------------------
 
 /** TDI I/O pin: Get Input.
@@ -615,6 +719,20 @@ CMSIS-DAP Hardware may provide LEDs that indicate the status of the CMSIS-DAP De
 It is recommended to provide the following LEDs for status indication:
  - Connect LED: is active when the DAP hardware is connected to a debugger.
  - Running LED: is active when the debugger has put the target device into running state.
+
+This board has ONE LED, DS11 on P111, and it is already owned by the USB status
+indicator in ../dap_thread_entry.c - which blinks slowly until enumerated, sits
+solid when idle, and blanks in proportion to SWD data volume. That single
+indicator conveys both "connected" and "running" more usefully than two separate
+LEDs would, so LED_INDEX_CONNECTED and LED_INDEX_RUNNING are -1 and both functions
+below are inert. Nothing is competing for the pin.
+
+Both functions therefore still carry the template's ACTIVE-HIGH polarity
+(bit ? HIGH : LOW), which is backwards for DS11 - it sinks through R53, so LOW
+lights it. That is latent, not live: with the indices at -1 the bounds test never
+passes. Anyone giving one of them a real index must fix the polarity at the same
+time, or use LED_STATUS_ON_LEVEL / LED_STATUS_OFF_LEVEL defined at the top of this
+file.
 */
 
 /** Debug Unit: Set status of Connected LED.
@@ -662,6 +780,22 @@ default, the DWT timer is used.  The frequency of this timer is configured with 
 
 /** Get timestamp of Test Domain Timer.
 \return Current timestamp value.
+
+\note DWT->CYCCNT is never enabled on this probe. Nothing in this firmware, in
+      ra_gen/, or in the FSP BSP sets DEMCR.TRCENA or DWT_CTRL.CYCCNTENA, so
+      unless a debugger is attached to the *probe itself* (which enables TRCENA
+      as a side effect) this returns a constant.
+
+      Two consequences. DAP_Info's timestamp capability and every timestamped
+      transfer report a frozen value. More importantly DAP_SWJ_Pins() in DAP.c
+      polls this to implement its wait timeout, so with a frozen counter that
+      loop has no working exit other than the pin already matching - a
+      DAP_SWJ_Pins request with a non-zero wait against a pin that never reaches
+      the asked-for level does not time out.
+
+      A fix would set DEMCR |= DEMCR_TRCENA and DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk
+      in DAP_SETUP(), and correct TIMESTAMP_CLOCK to 96000000U. Not done here:
+      both need a rebuild and a reflash to validate.
 */
 __STATIC_INLINE uint32_t TIMESTAMP_GET (void) {
   return (DWT->CYCCNT);

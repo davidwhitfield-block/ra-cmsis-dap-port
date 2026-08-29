@@ -1,6 +1,25 @@
 /*
  * J-Link script file used when programming the RA4M2 over SWD.
  *
+ * USED ONLY BY `make flash`. Neither scripts/flash.sh nor tools/recovery/recover.sh
+ * passes -JLinkScriptFile, and both program correctly without it - see
+ * scripts/README.md, "Where these scripts differ from `make flash`". So the premise
+ * argued below (that the reset dividers leave FCLK too slow for the sequencer) has
+ * not been re-tested against the J-Link version currently installed, and the
+ * evidence is that J-Link's own RA4M2 device support sets up what it needs. Treat
+ * this file as belt-and-braces, not as a requirement.
+ *
+ * It also does NOT protect against the two things that actually brick or re-lock a
+ * board. Cancelling FBPROT0/FBPROT1 below has no effect on BPS/PBPS block
+ * protection - those are separate registers with a permanent write freeze - and
+ * this script cannot stop `make flash`'s bare `erase` from blanking BPS_SEL on an
+ * already-recovered part. See tools/recovery/README.md.
+ *
+ * "Failed to erase sectors" therefore has at least three causes, and this file
+ * documents only one of them: FCLK below 4 MHz, an FPCKAR that disagrees with FCLK,
+ * and zeroed BPS/PBPS. Read BPS (0x0100A1C0) and PBPS (0x0100A1E0) before assuming
+ * a clock problem.
+ *
  * Out of reset the RA4M2 runs from MOCO with SCKDIVCR = 0x22022222, i.e.
  * ICK = FCK = /4, which puts FCLK at roughly 2 MHz. The RA4M2 flash sequencer
  * requires FCLK >= 4 MHz for code-flash program/erase, so J-Link can program

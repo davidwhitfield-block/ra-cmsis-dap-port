@@ -89,8 +89,24 @@ PBPS offsets, and `loadbin ... 0x0` programs them.
 
 A correct code-flash-only `.bin` is ~54 KB. `ra4m2/Makefile` builds it with
 `-R .option_setting -R .option_setting_ns -R .option_setting_s -R .data_flash`.
-**Keep it that way.** The `.srec` and `.elf` are both safe — neither format
-carries gap padding.
+**Keep it that way.**
+
+The `.srec` and `.elf` cannot reach BPS or PBPS — neither format carries gap
+padding — but they are **not** unconditionally safe. Both place
+`g_bsp_rom_bps_sel0 = 0xFFFFFFFF` at `0x0100A2C0` = BPS_SEL, via
+`.option_setting_bps_sel0` inside the loadable `.option_setting_s` section
+(`script/fsp.ld`, FSP's `bsp_rom_registers.c`). Verify on any build:
+
+```sh
+arm-none-eabi-nm ra4m2/Debug/*.elf | grep bps_sel0   # 0100a2c0 r g_bsp_rom_bps_sel0
+grep 0100A2C0 ra4m2/Debug/*.srec                     # S3110100A2C0FFFFFFFF...
+```
+
+On a **virgin** part that is a no-op. On a **recovered** part `loadfile` of either
+format rewrites BPS_SEL to `0xFFFFFFFF`, which re-selects the poisoned
+BPS/PBPS pair and re-locks the board at the next reset. Recoverable — just re-run
+`recover.sh` — but do not reach for the `.elf` or `.srec` as the "safe" option on a
+board that has already been through recovery. Use the `.bin`.
 
 Tell-tale that distinguishes this from any other failure: **code flash above
 the image reads `0x00`, not `0xFF`.** Erased flash is always `0xFF`, so `0x00`

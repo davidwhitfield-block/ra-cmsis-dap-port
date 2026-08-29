@@ -31,6 +31,11 @@ A second tell-tale: **code flash above the image reads `0x00`, not `0xFF`.**
 Erased flash is always `0xFF`, so `0x00` padding proves a zero-filled image was
 actually programmed.
 
+`Failed to erase sectors` is not diagnostic on its own — `ra4m2/script/ra4m2_flash.JLinkScript`
+blames the same string on an FCLK below the sequencer's 4 MHz floor, and names a
+mismatched `FPCKAR` as a third candidate. Read BPS and PBPS before concluding a
+part is poisoned. That is exactly what `scripts/flash.sh` does in its preflight.
+
 ## Cause
 
 The FSP ELF spans `0x0` to `0x0100_A2CC`. A plain `objcopy -O binary` therefore
@@ -42,10 +47,39 @@ emits a **16 MB** file and fills every gap with `0x00` — objcopy's default, no
 Per Table 6.2, applied PBPS=0 with applied BPS=0 means "programming and erasure
 to the corresponding block is invalid **permanently**".
 
-The `.srec` and `.elf` are both safe — neither format carries gap padding, so
-neither can reach `0x0100_A1C0`. **Only the flat `.bin` is dangerous.** A
-correct code-flash-only `.bin` is ~54 KB; `recover.sh` refuses anything over
-512 KB for exactly this reason.
+A correct code-flash-only `.bin` is ~54 KB; `ra4m2/Makefile` produces it with
+`-R .option_setting -R .option_setting_ns -R .option_setting_s -R .data_flash`,
+and `recover.sh` refuses anything over 512 KB for exactly this reason.
+
+### `.elf` and `.srec` are safe on a virgin part, and NOT on a recovered one
+
+Neither format carries gap padding, so neither can reach BPS (`0x0100_A1C0`) or
+PBPS (`0x0100_A1E0`): `.option_setting` is only `0x38` bytes
+(`0x0100_A100`–`0x0100_A137`) and `.option_setting_ns` is zero length. Against a
+part that has never been recovered, that is the whole guarantee and it holds.
+
+It does **not** extend to a recovered part. `script/fsp.ld` places
+`.option_setting_bps_sel0` at `0x0100_A2C0` — **BPS_SEL** — inside the loadable
+`.option_setting_s` section, and FSP emits a variable there:
+`bsp_rom_registers.c` defines `g_bsp_rom_bps_sel0 = BSP_CFG_ROM_REG_BPS_SEL0`,
+which is `0xFFFFFFFF`. Both artefacts carry it:
+
+```
+$ arm-none-eabi-nm  ra4m2/Debug/CMSIS_DAP_RA4M2.elf  | grep bps_sel0
+0100a2c0 r g_bsp_rom_bps_sel0
+$ grep 0100A2C0 ra4m2/Debug/CMSIS_DAP_RA4M2.srec
+S3110100A2C0FFFFFFFFFFFFFFFFFFFFFFFF97
+```
+
+`0xFFFFFFFF` is precisely the value that re-selects the poisoned non-secure pair.
+A `loadfile` of either artefact would erase the config block and write it back,
+re-locking a board recovered through the BPS_SEL redirect — the same mechanism as
+the bare-erase trap below. Reasoned from the linker script, `nm` and the SREC
+record; deliberately not tested on hardware, because there is one flashable
+board here.
+
+**Use the `-R`'d `.bin` and `scripts/flash.sh`. It is the only artefact and path
+that is safe in both states.**
 
 ## Why recovery is possible
 
@@ -78,7 +112,8 @@ Two separate places in the manual enumerate the permanent-lock restrictions and
 §6.3.4 then describes programming BPS_SEL to 0 as normal operation.
 
 The poisoned BPS/PBPS stay `00000000` forever. They are simply never consulted
-again.
+again — so a recovered board reading `BPS = PBPS = 0` is a healthy steady state,
+not a fault.
 
 ### What does *not* work
 
@@ -130,8 +165,66 @@ Clear one bit per block, leave reserved bits 1 (§6.2.4, Figure 6.2/6.3):
 | Part | Code flash | Blocks | BPS_SEL |
 |---|---|---|---|
 | R7FA4M2AB | 256 KB | 0–13 | `0xFFFFC000` |
-| — | 384 KB | 0–17 | `0xFFFC0000` |
+| R7FA4M2AC | 384 KB | 0–17 | `0xFFFC0000` |
 | R7FA4M2AD | 512 KB | 0–21 | `0xFFC00000` |
+
+The part letter is the code-flash size field of the part number — datasheet
+**R01DS0367EJ0150 rev 1.50**, Figure 1.2: `B: 256 KB`, `C: 384 KB`, `D: 512 KB`.
+Only the 256 KB `R7FA4M2AB3CNE` has been exercised on this bench; the other two
+masks are derived from the block map, not measured.
+
+`recover.sh` auto-derives the mask for `R7FA4M2AB*` and `R7FA4M2AD*` only,
+despite its `--mask` help text implying all three rows come from `--device`. On
+an `R7FA4M2AC` it exits 1 with *"cannot derive BPS_SEL mask for 'R7FA4M2AC';
+pass --mask"*. Pass `--mask 0xFFFC0000` explicitly, or add the missing case:
+
+```sh
+R7FA4M2AC*) BPS_SEL_MASK="0xFFFC0000" ;;  # 384 KB, blocks 0-17
+```
+
+A mask that clears too few bits cannot be widened by re-running `recover.sh`:
+the unlock step is skipped whenever `BPS_SEL` already reads anything but
+`FFFFFFFF`. Run `02-unlock.jlink` by hand with the wider `WD1`/`WD2` instead.
+Configuration Set programs, it does not erase, so a bit already at 0 cannot be
+written back to 1 by re-running it — only a config-area erase puts 1s back, and
+on a recovered part that erase re-locks the board (see Traps). This one-way
+property is inferred from flash semantics and from the deliberately reproduced
+chip-erase re-lock; writing `FFFFFFFF` back into `BPS_SEL` has not been
+attempted.
+
+### Rough edges in `recover.sh`
+
+Neither of these has broken a board here, but both are live and neither is
+obvious from the script's output.
+
+**A healthy part gets its BPS_SEL redirected anyway.** With
+`BPS = PBPS = FFFFFFFF` the preflight prints *"Block protection is not poisoned;
+nothing to unlock"* and then **falls through** — it exits early only under
+`--skip-flash`. The unlock step's own test is just `[[ "$BPS_SEL" != "FFFFFFFF" ]]`,
+which a virgin part fails, so four lines later the same run prints
+*"2/4  Redirect BPS_SEL -> 0xFFFFC000"* and programs it. Nothing breaks today:
+`BPS_SEC`/`PBPS_SEC` are `FFFFFFFF`, so blocks 0–13 stay fully programmable by
+exactly the mechanism the recovery relies on. The cost is that `BPS`/`PBPS`
+become a silent no-op for those blocks, and the write is one-way. Restoring
+`FFFFFFFF` needs a config-area erase — which is **safe on a healthy part**, whose
+`BPS`/`PBPS` are still `FFFFFFFF`, and forbidden only on a *recovered* part,
+where blanking `BPS_SEL` re-locks the board. Do not conflate the two states.
+Exposure is limited to direct invocations of `recover.sh`; `scripts/flash.sh`
+gates on its own poisoned test and calls `recover.sh` only for a part it has
+already judged poisoned. The fix is to gate the unlock on the diagnosis rather
+than on `BPS_SEL` alone.
+
+**The two scripts do not classify state identically.** `recover.sh` calls a part
+healthy when `BPS == FFFFFFFF && PBPS == FFFFFFFF`; `flash.sh` calls it poisoned
+when `BPS == 00000000 || PBPS == 00000000`. A partially-set value such as
+`BPS = FFFFC000` is neither, and the two scripts take different branches on it.
+No such part has been seen here.
+
+Related: the `DLMMON` gate runs before the unlock is even decided on, so a
+healthy part sitting below DBG2 dies with exit code 2 — the code `recover.sh`
+reserves for *"not recoverable (secure pair also poisoned — replace the IC)"* —
+when all it needed was a flash. DBG2 is only required to program the secure
+region, i.e. only on the unlock path.
 
 ## Traps
 
@@ -141,6 +234,25 @@ re-locking the board. BPS/PBPS cannot be un-zeroed by that erase (Table 44.22),
 so you land straight back in the poisoned state. Use a ranged erase, or just
 `loadbin`, which erases only the sectors it needs. If it happens, re-run
 `recover.sh` — it is idempotent.
+
+The concrete offender in this repo is **`ra4m2/Makefile`'s `flash` target**,
+whose recipe issues a bare `erase` before `loadbin`. Prefer `scripts/flash.sh`,
+which uses `loadbin` alone and re-reads `BPS_SEL` afterwards to prove nothing
+blanked it.
+
+**`--skip-flash` still erases block 0, and nothing puts it back.** Step 3/4
+proves the unlock by erasing `0x00000000`–`0x00001FFF` — block 0, 8 KB,
+containing the vector table (`03-verify.jlink`) — and that step runs
+unconditionally. `--skip-flash` is only honoured afterwards, at the flash step.
+The one early exit that avoids the erase requires `BPS == PBPS == FFFFFFFF`,
+which an already-recovered board never satisfies: its BPS/PBPS stay `00000000`
+forever. So on a working, previously recovered board,
+`./recover.sh --sn 821000843 --skip-flash` erases the vector table and exits 0
+printing *"Done (unlock only)"*. On a still-poisoned part the erase costs nothing
+— block 0 was unusable anyway — so the trap is specifically re-running it on a
+healthy board. Use `--skip-flash` only on a part you are about to reprogram, and
+keep a known-good `.bin` to hand. `scripts/flash.sh` is unaffected: it always
+passes `--bin`.
 
 **Never point a programmer at `0x0100_A1xx`** on an RA part unless you intend
 the result.
@@ -157,3 +269,7 @@ erase. After the redirect, block 0 erased, a full reflash reported
 re-enumerated as `RA4M2 CMSIS_DAP Probe` (VID `0x045B`, PID `0x201F`). The
 re-lock trap was then reproduced deliberately with a chip erase and recovered
 again from scratch.
+
+The two rough edges above, the `--skip-flash` block-0 erase and the
+`.elf`/`.srec` BPS_SEL hazard were found by reading the scripts and the linked
+artefacts, not by running them on hardware.

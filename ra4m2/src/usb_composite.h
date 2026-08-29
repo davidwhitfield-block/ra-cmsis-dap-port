@@ -20,17 +20,37 @@
  *
  * Copyright (C) 2020 Renesas Electronics Corporation. All rights reserved.
  ***********************************************************************************************************************/
+/* Shared definitions for the composite USB device: the VCOM (CDC) side, the
+ * Microsoft OS descriptor structures the CMSIS-DAP interface needs on Windows, and
+ * the SWO plumbing types. Included by dap_thread_entry.c, swo_thread_entry.c and
+ * r_usb_pcdc_pvnd_descriptor.c. */
 #ifndef USB_COMPOSITE_H_
 #define USB_COMPOSITE_H_
 
 #define LINE_CODING_LENGTH (0x07U) // Line coding length
+/* Must equal the CDC bulk endpoint wMaxPacketSize in r_usb_pcdc_pvnd_descriptor.c
+ * (USB_MXPS_BULK_FULL). It sizes both PCDC_ToTarget[][] and the g_PCDC_tx_data
+ * staging buffer in dap_thread_entry.c. */
 #define CDC_DATA_LEN (64U)
-#define UART_PACKET_COUNT 255 
+/* Depth of the VCOM host->target ring. 255 x 64 = ~16 KB of .bss; unlike
+ * DAP_PACKET_COUNT this was never tuned, and it is generous for a serial bridge.
+ * Wrapping is done by explicit compare, not by masking, so it need not be 2^n. */
+#define UART_PACKET_COUNT 255
 
 /* Macro definitions */
+/* FSP's sentinel for "no flow-control pin configured", checked before touching
+ * g_uart_ctrl.flow_pin on a SET_CONTROL_LINE_STATE. */
 #define SCI_UART_INVALID_16BIT_PARAM   (0xFFFFU)
+/* Max baud error accepted by R_SCI_UART_BaudCalculate(), in 1/1000 percent -
+ * 5000 = 5%. Applies to both the VCOM line coding and the SWO baud request. */
 #define BAUD_ERROR_RATE                (5000U)
 #define INVALID_SIZE                   (0U)
+/* Interface numbers, and they must agree with the configuration descriptor in
+ * r_usb_pcdc_pvnd_descriptor.c and with the two sections of `ecd` (the Extended
+ * Compat ID descriptor). Interfaces 0 and 1 are the CDC pair; 2 is CMSIS-DAP. The
+ * dap_thread_entry.c handler for USB_VENDOR_GET_MS_DESCRIPTOR_INTERFACE compares
+ * the request's low byte against INTERFACE_CMSIS_DAP, so a mismatch here makes
+ * Windows fail to bind WinUSB with no other symptom. */
 #define INTERFACE_PCDC_FIRST 0x0
 #define INTERFACE_CMSIS_DAP 0x2
 
@@ -76,12 +96,25 @@ typedef struct _SWO_USB_STAT {
 } SWO_USB_STAT;
 void ProcessUartSwoQueue(void);
 void ProcessUsbSwoQueue(void);
+/* One SWO->USB transfer request, posted to g_queue_swo_usb by
+ * swo_thread_entry.c's SWO_QueueTransfer() and issued by ProcessUsbSwoQueue() in
+ * dap_thread_entry.c. {buf = NULL, num = 0} is the agreed abort sentinel, meaning
+ * "stop the pipe" rather than "write nothing". */
 typedef __PACKED_STRUCT {
     uint8_t *buf;
     uint32_t num;
 } SWO_USB_REQUEST;
 
-#define MS_VENDOR_CODE_CMSIS_DAP 0x00 
+/* bRequest for the Microsoft OS 1.0 vendor requests. Windows takes this byte from
+ * the MSFT100 string descriptor at string index 0xEE and echoes it back as
+ * bRequest, so this constant must equal the one embedded in that descriptor in
+ * r_usb_pcdc_pvnd_descriptor.c.
+ *
+ * 0x00 is an unusual choice - most devices use something conspicuous like 0x5E -
+ * but it is legal, and it works because the two macros below fold it together with
+ * the direction/type/recipient bits, giving request_type values that cannot
+ * collide with the standard or CDC class requests handled alongside them. */
+#define MS_VENDOR_CODE_CMSIS_DAP 0x00
 
 // Extended compat ID OS descriptor.
 #define EXT_COMPATID_OS_DESCRIPTOR 0x04

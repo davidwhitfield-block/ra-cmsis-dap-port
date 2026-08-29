@@ -1,3 +1,39 @@
+/***********************************************************************************************************************
+ * dap_thread_entry.c - the probe's main thread.
+ *
+ * Everything the host asks of this board arrives here. One FreeRTOS task owns
+ * three logical streams, all multiplexed onto one composite USB device:
+ *
+ *   CMSIS-DAP v2   bulk OUT `cmd_pipe` -> DAP_ExecuteCommand() -> bulk IN `rsp_pipe`.
+ *                  This is the debug probe proper. Pipe numbers are discovered at
+ *                  SET_CONFIGURATION, not hardcoded - see process_usb_events().
+ *   VCOM (CDC)     host bulk OUT -> SCI2 TXD (P302), SCI2 RXD (P301) -> host bulk IN.
+ *                  A plain USB-serial bridge to the target, unrelated to SWD.
+ *   SWO            SCI0 RXD (P100) -> ../src/swo_thread_entry.c -> bulk IN `swo_pipe`.
+ *                  Only the USB half lives here (ProcessUsbSwoQueue()).
+ *
+ * Structure, in the order things happen:
+ *   dap_thread_entry()    one-time setup (serial number from the device UID, USB
+ *                         open, UART open, semaphores), then an endless loop that
+ *                         drains the USB event queue, runs DAP commands, services
+ *                         VCOM in both directions, pumps SWO, and updates the LED.
+ *   process_usb_events()  the state machine behind that queue: enumeration, read
+ *                         and write completions, CDC class requests, suspend/detach.
+ *   usb_composite_callback()  FSP's callback; posts to the queue and wakes the thread.
+ *   user_uart_callback()  SCI2 ISR side of VCOM.
+ *   status_led_update()   drives DS11.
+ *
+ * The thread never blocks for long: it parks on xSemaphoreTake(g_sem_DAP_Thread, 1),
+ * so it wakes on any USB event and otherwise turns over once per tick (1 ms). That
+ * 1-tick timeout is also what guarantees the LED keeps moving on a quiet bus.
+ *
+ * Concurrency: the USB_* and PCDC_* ring variables below are touched from this
+ * thread and from process_usb_events(), which runs on this same thread (it is
+ * called from the loop, not from the callback) - so they need no locking against
+ * each other. user_uart_callback() is the only genuine ISR context, and it talks
+ * only through FreeRTOS queues and semaphores.
+ **********************************************************************************************************************/
+
 #include "dap_thread.h"
 #include "common_utils.h"
 #include "usb_composite.h"
@@ -28,15 +64,23 @@
  *
  * The blank rate is proportional to DATA VOLUME, one blank per
  * ACTIVITY_LED_BYTES moved, so the LED tells you how much is flowing and not
- * merely that something is: ~6 Hz flicker at the ~316 KiB/s ceiling, ~3 Hz at
- * half rate, ~1 Hz for a trickle. Bounded at both ends - MIN_PERIOD keeps a
- * saturated transfer from blurring back into a dim glow, MAX_PERIOD keeps a very
- * slow one (single register pokes from a debugger) visibly alive. */
+ * merely that something is: ~3 Hz at half the ceiling rate, ~1 Hz for a trickle.
+ * Bounded at both ends - MIN_PERIOD keeps a saturated transfer from blurring back
+ * into a dim glow, MAX_PERIOD keeps a very slow one (single register pokes from a
+ * debugger) visibly alive.
+ *
+ * Mind the arithmetic on the two bounds: both name the ON phase only, and every
+ * cycle costs an extra ACTIVITY_LED_OFF_TICKS of blank on top. So the real period
+ * is MIN_PERIOD + OFF_TICKS = 195 ms (~5.1 Hz) at the fast end and MAX_PERIOD +
+ * OFF_TICKS = 1245 ms (~0.80 Hz) at the slow end. 48 KiB per blank at the measured
+ * ~313 KiB/s SWD ceiling wants ~6.5 Hz, so a saturated transfer sits pinned at the
+ * MIN_PERIOD cap and the flicker stops getting faster - which is the point of the
+ * cap, but it also means "as fast as it goes" is ~5 Hz, not 6.7. */
 #define STATUS_LED_BLINK_TICKS  pdMS_TO_TICKS(500)      /* not enumerated: half period */
 #define ACTIVITY_LED_BYTES      (48U * 1024U)           /* data moved per blank */
 #define ACTIVITY_LED_OFF_TICKS  pdMS_TO_TICKS(45)       /* blank width - long enough to see */
-#define ACTIVITY_LED_MIN_PERIOD pdMS_TO_TICKS(150)      /* fastest cadence (~6.7 Hz) */
-#define ACTIVITY_LED_MAX_PERIOD pdMS_TO_TICKS(1200)     /* slowest cadence (~0.8 Hz) */
+#define ACTIVITY_LED_MIN_PERIOD pdMS_TO_TICKS(150)      /* shortest ON phase; +45 ms = ~5.1 Hz */
+#define ACTIVITY_LED_MAX_PERIOD pdMS_TO_TICKS(1200)     /* longest ON phase;  +45 ms = ~0.80 Hz */
 #define ACTIVITY_LED_IDLE_TICKS pdMS_TO_TICKS(300)      /* quiet this long -> back to solid */
 
 /* Bytes moved over SWD, accumulated per executed DAP command as the larger of
@@ -47,7 +91,22 @@
  * comparison is an unsigned difference. */
 static volatile uint32_t g_dap_bytes;
 
-/* external variables*/
+/* external variables
+ *
+ * All but g_bsp_leds are defined in src/r_usb_pcdc_pvnd_descriptor.c: the USB
+ * descriptor set, the serial-number string that dap_thread_entry() rewrites from
+ * the device UID, and the two Microsoft OS descriptors (`ecd` = extended compat ID,
+ * ExtendedPropertiesDescriptor = the WinUSB GUID) that let Windows bind WinUSB to
+ * the CMSIS-DAP interface without an .inf.
+ *
+ * g_bsp_leds comes from FSP's ra_gen/bsp_pin_cfg or the BSP board file and is
+ * declared `const bsp_leds_t` there. Re-declaring it non-const here is a type
+ * mismatch that the linker does not diagnose; it works because status_led_update()
+ * only ever reads it. Left as-is rather than corrected, because changing it is a
+ * code change needing a rebuild and reflash to validate - see the audit notes.
+ *
+ * SWO_TransferComplete() is prototyped by hand instead of via a header because
+ * CMSIS-DAP/SWO.c does not export one. */
 extern uint8_t g_apl_configuration[];
 extern uint8_t g_apl_report[];
 extern bsp_leds_t g_bsp_leds;
@@ -57,6 +116,22 @@ extern tyRAM4ECID ecd;
 void SWO_TransferComplete(void);
 
 /* Local Module Variables */
+
+/* True from SET_CONFIGURATION until the device is physically detached.
+ *
+ * This is the single gate on almost everything: it selects solid-vs-slow-blink on
+ * the LED, and it guards the USB_STATUS_READ_COMPLETE and USB_STATUS_WRITE_COMPLETE
+ * bodies in process_usb_events(), so while it is false every completed transfer is
+ * dropped on the floor.
+ *
+ * Set in exactly one place (USB_STATUS_CONFIGURED, after the pipes are discovered
+ * and the first reads are posted) and cleared in exactly one place
+ * (USB_STATUS_DETACH). Notably NOT cleared on USB_STATUS_SUSPEND - see the long
+ * comment on that case for why that used to be a one-way door.
+ *
+ * scripts/flash.sh reads this symbol's address out of the ELF with
+ * arm-none-eabi-nm and reports its value after a flash, so it is deliberately a
+ * file-scope static with a stable name rather than a local or a bitfield. */
 static bool b_usb_configured = false;
 
 /*******************************************************************************************************************//**
@@ -145,6 +220,36 @@ static void status_led_update (void)
 }
 static usb_pcdc_linecoding_t g_line_coding;
 
+/* The two CMSIS-DAP rings, request (host -> probe) and response (probe -> host).
+ *
+ * The naming is upstream ARM's and is easy to read backwards. "I" is IN to the
+ * ring (producer) and "O" is OUT of it (consumer) - NOT the USB sense of IN/OUT.
+ * So for the request ring the producer is USB (a completed bulk OUT read bumps
+ * IndexI/CountI) and the consumer is the DAP loop; for the response ring the
+ * producer is the DAP loop and the consumer is USB.
+ *
+ * Each ring carries both an index and a count. The index wraps at
+ * DAP_PACKET_COUNT and says *where*; the free-running 16-bit count says *how many*
+ * and is what the fullness tests use, because IndexI == IndexO is ambiguous
+ * between empty and full. Every such test is written as an unsigned difference
+ * ((uint16_t)(CountI - CountO)), so wrap at 65535 is harmless. There is no
+ * modular arithmetic on the indices - they are stepped and compared against
+ * DAP_PACKET_COUNT by hand - so DAP_PACKET_COUNT does *not* have to be a power of
+ * two (unlike the SWO capture ring in swo_thread_entry.c, which does).
+ *
+ * The Idle flags close the loop between the two halves. `USB_RequestIdle` means
+ * "no bulk OUT read is posted, because the ring was full"; whoever frees a slot
+ * re-posts the read. `USB_ResponseIdle` means "no bulk IN write is in flight";
+ * whoever produces a response starts one. Miss either hand-off and the pipeline
+ * stalls silently with the host waiting forever.
+ *
+ * `volatile` here is habit rather than necessity: every one of these is touched
+ * only from the DAP thread (process_usb_events() is called from the loop, not from
+ * the USB callback), so there is no cross-context access to order.
+ *
+ * Sizing: DAP_PACKET_COUNT x DAP_PACKET_SIZE is 8 x 1024, so these two arrays are
+ * 16 KB of .bss on a 128 KB part. That is the reason DAP_PACKET_COUNT is 8 and not
+ * upstream's 255 - see CMSIS-DAP/DAP_config.h. */
 static volatile uint16_t USB_RequestIndexI; // Request Index In
 static volatile uint16_t USB_RequestIndexO; // Request Index Out
 static volatile uint16_t USB_RequestCountI; // Request Count In
@@ -159,8 +264,22 @@ static volatile uint8_t USB_ResponseIdle;    // Response Idle  Flag
 
 static uint8_t USB_Request[DAP_PACKET_COUNT][DAP_PACKET_SIZE];
 static uint8_t USB_Response[DAP_PACKET_COUNT][DAP_PACKET_SIZE];
+/* Responses are variable length, so unlike requests the ring needs to carry the
+ * length alongside the buffer - it is what R_USB_PipeWrite() is given. */
 static uint16_t USB_RespSize[DAP_PACKET_COUNT];
 
+/* The VCOM host->target ring. Same discipline as the DAP request ring above and
+ * the same I/O naming, just a different depth (UART_PACKET_COUNT) and width
+ * (CDC_DATA_LEN, the CDC bulk endpoint size).
+ *
+ * The trailing "Request ..." comments on the next five lines are copy-paste from
+ * the DAP block and mean nothing here - this ring carries VCOM bytes destined for
+ * the target's UART, not DAP requests. Kept only so a diff against upstream stays
+ * legible.
+ *
+ * There is no matching ToHost ring: the target->host direction goes straight from
+ * user_uart_callback() into g_queue_uart_tx_8 / _16 and is drained into
+ * g_PCDC_tx_data in the main loop. */
 static volatile uint16_t PCDC_ToTargetIndexI; // Request Index In
 static volatile uint16_t PCDC_ToTargetIndexO; // Request Index Out
 static volatile uint16_t PCDC_ToTargetCountI; // Request Count In
@@ -170,6 +289,10 @@ static volatile uint8_t PCDC_ToTargetIdle;    // Request Idle  Flag
 static uint8_t PCDC_ToTarget[UART_PACKET_COUNT][CDC_DATA_LEN];
 static uint16_t PCDC_ToTargetSize[UART_PACKET_COUNT];
 
+/* Staging copy for the in-flight UART write. R_SCI_UART_Write() is asynchronous
+ * and does not take ownership, so the ring slot cannot be handed to it directly -
+ * it would be recycled under the DMA/ISR. The g_sem_uart_tx semaphore is what
+ * bounds this to one outstanding write, and UART_EVENT_TX_COMPLETE returns it. */
 static uint8_t g_buf_uart_tx[CDC_DATA_LEN];
 
 static usb_pcdc_ctrllinestate_t g_control_line_state = {
@@ -188,10 +311,33 @@ static bool enable_bitrate_modulation = true;
 
 static uint32_t g_baud_rate = RESET_VALUE;
 static uint32_t error_rate_x_1000 = BAUD_ERROR_RATE;
+/* Working copy of g_uart_cfg. SET_LINE_CODING reopens SCI2 from this, so the
+ * generated config in ra_gen/ stays pristine and a bad baud request from the host
+ * cannot corrupt the defaults. sci_extend_cfg likewise shadows g_uart_cfg.p_extend
+ * because g_uart_test_cfg.p_extend has to point at storage we own - it is where
+ * the recalculated baud_setting lands. */
 static uart_cfg_t g_uart_test_cfg;
 static sci_uart_extended_cfg_t sci_extend_cfg;
+/* Dead. Written in five places in the main loop (UART_TXING / UART_RXING) and read
+ * by nobody - there is no reader anywhere in the firmware. It was presumably meant
+ * to drive an activity LED; the status LED is driven from g_dap_bytes instead, so
+ * this only tracks VCOM and would not have shown SWD traffic at all. Harmless, and
+ * kept because removing it is a code change. */
 static uint32_t g_uart_activity = 0x0;
 static uint8_t g_PCDC_tx_data[CDC_DATA_LEN];
+
+/* Pipe numbers are DISCOVERED at enumeration, not hardcoded.
+ *
+ * The composite device's endpoint-to-pipe assignment comes out of the FSP USB
+ * stack and the descriptor set in src/r_usb_pcdc_pvnd_descriptor.c, and it is not
+ * something this file gets to choose. So process_usb_events() walks pipes 1..9 at
+ * USB_STATUS_CONFIGURED, asks R_USB_PipeInfoGet() about each, and claims the
+ * first bulk OUT that is not the CDC one as cmd_pipe and the first two bulk INs
+ * that are not the CDC one as rsp_pipe and swo_pipe.
+ *
+ * END_PIPE doubles as the "not found yet" sentinel, which is why these three
+ * initialise to it: `== END_PIPE` is the claim test in that loop. They are also
+ * non-static because swo_thread_entry.c refers to swo_pipe. */
 #define START_PIPE (USB_PIPE1)   // Start pipe number
 #define END_PIPE (USB_PIPE9 + 1) // Total pipe
 
@@ -306,6 +452,20 @@ static void handle_error(fsp_err_t err, char *err_str)
     }
 }
 
+/*******************************************************************************************************************/ /**
+  * @brief     Pump one queued SWO->USB request onto the SWO bulk IN pipe.
+  *
+  * CMSIS-DAP/SWO.c runs in the SWO thread but must not call R_USB_PipeWrite()
+  * itself, so it posts SWO_USB_REQUEST records to g_queue_swo_usb and this thread
+  * issues them. `{buf = NULL, num = 0}` is the agreed abort sentinel - it means
+  * SWO_AbortTransfer() wants the pipe stopped rather than written.
+  *
+  * Non-blocking (timeout 0) and drains exactly one request per call, because it
+  * sits in the main loop next to the DAP path and must not starve it. Depth is
+  * bounded by the queue, and SWO.c keeps at most one transfer outstanding anyway.
+  * @param[IN] None
+  * @retval    None
+  **********************************************************************************************************************/
 void ProcessUsbSwoQueue(void)
 {
     fsp_err_t err = FSP_SUCCESS;
@@ -331,10 +491,29 @@ void ProcessUsbSwoQueue(void)
     }
 }
 /*******************************************************************************************************************/ /**
-  * @brief     Function processes usb status request.
-  * @param[IN] None
-
-  * @retval    Any Other Error code apart from FSP_SUCCESS on Unsuccessful operation.
+  * @brief     FreeRTOS entry point for the probe's main thread. Never returns.
+  *
+  * Setup, once: derive the USB serial number from the device UID, open USB, open
+  * SCI2 for VCOM, sync the CDC line coding to it, and prime the two TX semaphores
+  * so the first write in each direction can go out.
+  *
+  * Then loop forever, in this order:
+  *   1. Drain g_queue_usb_event through process_usb_events(), and after each event
+  *      run every DAP request the ring now holds to completion. That inner loop is
+  *      the hot path - it can run for many milliseconds under a bulk transfer,
+  *      which is why it updates the LED itself rather than waiting for step 5.
+  *   2. VCOM host->target: one ring slot per pass, gated by g_sem_uart_tx.
+  *   3. VCOM target->host: drain the RX queue into one bulk IN, gated by
+  *      g_sem_pcdc_tx and by b_usb_configured.
+  *   4. SWO, both halves (USB out, UART in).
+  *   5. Status LED, then park on g_sem_DAP_Thread with a 1-tick timeout.
+  *
+  * The 1-tick timeout is deliberate: usb_composite_callback() gives the semaphore
+  * on every USB event so real work wakes immediately, and the timeout only bounds
+  * how stale the LED and the VCOM polls can get on a silent bus.
+  *
+  * @param[IN] pvParameters  Unused; required by the FreeRTOS task signature.
+  * @retval    None. Does not return.
   **********************************************************************************************************************/
 void dap_thread_entry(void *pvParameters)
 {
@@ -348,6 +527,21 @@ void dap_thread_entry(void *pvParameters)
     /* Enabled permanently for DAP and Led activity. */
     R_BSP_PinAccessEnable();
 
+    /* Give the device a per-board USB serial number, from the 128-bit factory UID.
+     *
+     * The descriptor is a UTF-16LE string, so bLength - 2 bytes hold (bLength-2)/2
+     * characters. Here bLength is STRING_DESCRIPTOR6_LEN = 28, giving maxIndex =
+     * 13: only 13 of the 32 hex digits fit, i.e. the low nibble of UID byte 6
+     * onwards is simply never shown. That is where a serial like "5196032D34385"
+     * comes from - it is a truncation of the UID, not a hash, and two boards are
+     * distinguishable only if they differ within those first 6.5 bytes. Widening it
+     * means growing STRING_DESCRIPTOR6_LEN in src/r_usb_pcdc_pvnd_descriptor.c;
+     * nothing here needs to change.
+     *
+     * The clamp below is in the wrong units - maxIndex counts characters, while
+     * sizeof(unique_id_bytes) is 16 bytes and the real limit is the 32 hex digits
+     * in g_print_buffer. It caps at half what it could, but it caps low, so it is
+     * safe: with the current bLength of 28 it never fires at all. Left alone. */
     if (g_apl_string_descriptor_serial_number[0] >= 4)
     {
         uint32_t maxIndex = (uint32_t)((g_apl_string_descriptor_serial_number[0] - 2) / 2);
@@ -357,7 +551,9 @@ void dap_thread_entry(void *pvParameters)
             /* Remaining id bytes are fixed */
             maxIndex = sizeof(p_uid->unique_id_bytes);
         }
-        /* Update the USB Serial Number with the device UID */
+        /* Update the USB Serial Number with the device UID. Writing only the even
+         * bytes leaves the 0x00 high halves of the UTF-16LE pairs already in the
+         * initialiser untouched, so the descriptor stays well-formed. */
         sprintf(g_print_buffer, "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
                 p_uid->unique_id_bytes[0], p_uid->unique_id_bytes[1],
                 p_uid->unique_id_bytes[2], p_uid->unique_id_bytes[3],
@@ -421,7 +617,22 @@ void dap_thread_entry(void *pvParameters)
             while (USB_RequestCountI != USB_RequestCountO)
             {
 
-                // Handle Queue Commands
+                /* Handle Queue Commands.
+                 *
+                 * ID_DAP_QueueCommands (0x7E) means "execute this packet, but do
+                 * not send its response yet - more are coming". A host uses it to
+                 * keep several packets in flight without waiting for each reply.
+                 *
+                 * The trick is that it is handled entirely by REWRITING the opcode:
+                 * walk forward from the oldest unprocessed packet, turning every
+                 * leading ID_DAP_QueueCommands into ID_DAP_ExecuteCommands (0x7F),
+                 * and stop at the first packet that is not one (or at IndexI, the
+                 * end of what has arrived). DAP.c then sees only ExecuteCommands
+                 * and needs no queueing logic of its own.
+                 *
+                 * Note this rewrites the buffer in place and the outer loop then
+                 * executes only USB_Request[USB_RequestIndexO]; the rest are left
+                 * rewritten for the passes that follow. */
                 n = USB_RequestIndexO;
                 while (USB_Request[n][0] == ID_DAP_QueueCommands)
                 {
@@ -613,6 +824,24 @@ static fsp_err_t process_usb_events(usb_event_info_t *p_event_info)
     case USB_STATUS_CONFIGURED: /* Configured State */
     {
         APP_PRINT("USB Configured Successfully\r\n");
+
+        /* Discover which FSP pipes the enumerated endpoints landed on.
+         *
+         * R_USB_UsedPipesGet() returns a bitmask of pipes claimed by the vendor
+         * class; each set bit is then queried for direction and transfer type. The
+         * two CDC pipes are excluded explicitly by number (USB_CFG_PCDC_BULK_OUT /
+         * _IN), so what is left is the CMSIS-DAP OUT and the two INs.
+         *
+         * Order matters and is fragile: rsp_pipe is claimed by the FIRST unclaimed
+         * bulk IN and swo_pipe by the second, purely by ascending pipe number. That
+         * is only correct because the descriptor set in
+         * src/r_usb_pcdc_pvnd_descriptor.c lists the CMSIS-DAP IN endpoint before
+         * the SWO one. Reorder those endpoints and SWO data goes out on the DAP
+         * response pipe with no error anywhere - the APP_PRINT lines below are the
+         * only witness, so check them if SWO ever comes back as garbage.
+         *
+         * Re-entry is safe: the `== END_PIPE` guards mean a second
+         * SET_CONFIGURATION does not reshuffle pipes already claimed. */
         R_USB_UsedPipesGet(&g_basic1_ctrl, &used_pipe, USB_CLASS_PVND);
         for (pipe = START_PIPE; pipe < END_PIPE; pipe++)
         {
@@ -1018,6 +1247,26 @@ void usb_composite_callback(usb_event_info_t *p_event_info, usb_hdl_t handler, u
     FSP_PARAMETER_NOT_USED(handler);
     FSP_PARAMETER_NOT_USED(on_off);
 
+    /* The queue carries POINTERS, not copies - four bytes per entry, and
+     * g_queue_usb_event is 20 entries deep (ra_gen/common_data.c).
+     *
+     * What they point into is FSP's own g_usb_cstd_event[], a 10-slot array that
+     * usb_set_event() (ra/fsp/src/r_usb_basic/src/driver/r_usb_clibusbip.c) fills
+     * round-robin: it writes slot `count`, calls this callback with
+     * &g_usb_cstd_event[count], then does count = (count + 1) % USB_EVENT_MAX with
+     * USB_EVENT_MAX = 10. The storage is therefore recycled after 10 further
+     * events, whether or not we have read it.
+     *
+     * So the deeper 20-entry queue buys nothing: let 11 events land before the DAP
+     * thread drains them and the oldest queued pointer now aliases a slot that has
+     * been overwritten with a newer event, silently. In practice the thread is
+     * woken by the give below and drains the queue in a tight while loop before
+     * doing anything else, so the backlog stays at one or two - but it is why that
+     * drain loop must stay ahead of everything else in the main loop, and why an
+     * event body must not block.
+     *
+     * A zero-tick timeout is mandatory, not an optimisation: this runs in the USB
+     * PCD task and blocking here would deadlock the stack against itself. */
     if (pdTRUE != (xQueueSend(g_queue_usb_event, (const void *)&p_event_info, (TickType_t)(RESET_VALUE))))
     {
         APP_ERR_PRINT("\r\n !! usb_composite_callback xQueueSend failed. \r\n");

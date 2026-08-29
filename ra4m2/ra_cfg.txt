@@ -1,3 +1,23 @@
+NOTE - this file is a HUMAN-READABLE SNAPSHOT, not a build input.
+Nothing in the Makefile reads it. The authoritative configuration is
+configuration.xml (edited by the e2 studio RA Configuration editor) and, for the
+build, the headers generated from it under ra_gen/ and ra_cfg/. e2 studio rewrites
+this file on each generation, so it can drift from the headers whenever generation
+is skipped - and it has.
+
+Known drift, corrected in place below:
+  - "PLL Mul x10.0" was stale. ra_gen/bsp_clock_cfg.h has
+    BSP_CFG_PLL_MUL = BSP_CLOCKS_PLL_MUL(16U,0U), i.e. x16.0. That is what gives
+    12 MHz XTAL -> PLL 192 MHz -> ICLK /2 = 96 MHz, confirmed on hardware by
+    SCKDIVCR = 0x21021221. CMSIS-DAP/DAP_config.h's CPU_CLOCK must stay in step
+    with the header, not with this file.
+  - "Pin Configurations: RA4M2 EK -> g_bsp_pin_cfg" is a leftover label from the
+    upstream EK-RA4M2 project. The pin set is the X2C Automation one; see
+    ra_gen/bsp_pin_cfg.h and the pin table in the root README.
+
+When in doubt, trust ra_gen/. If e2 studio regenerates this file these notes will
+be lost, which is fine - a regenerated copy is by definition current.
+
 FSP Configuration
   Board "X2C_AUTOMATION"
   R7FA4M2AB3CNE
@@ -70,7 +90,7 @@ FSP Configuration
     HOCO 20MHz
     PLL Src: XTAL
     PLL Div /1
-    PLL Mul x10.0
+    PLL Mul x16.0
     PLL2 Src: XTAL
     PLL2 Div /1
     PLL2 Mul x20.0

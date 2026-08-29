@@ -1287,6 +1287,27 @@ static uint32_t DAP_Transfer(const uint8_t *request, uint8_t *response) {
 //   request:  pointer to request data
 //   response: pointer to response data
 //   return:   number of bytes in response
+//
+// UNBOUNDED RESPONSE WRITE - the worst case of the general defect described above
+// DAP_ExecuteCommand(). request_count is read straight off the wire as a 16-bit
+// little-endian value and is never clamped:
+//
+//   request_count = (uint32_t)(*(request+0) << 0) | (uint32_t)(*(request+1) << 8);
+//
+// On the read path each iteration appends 4 bytes to `response`. A 5-byte request
+// asking for 65535 words therefore produces up to 262,144 response bytes into a
+// buffer of DAP_PACKET_SIZE = 1024. There is no runtime length check anywhere on
+// this path.
+//
+// It is safe in practice only because hosts honour the packet size the probe
+// reports through DAP_Info, and this is upstream ARM code left unforked. In
+// ../dap_thread_entry.c the destination is USB_Response[DAP_PACKET_COUNT][1024],
+// so an overrun walks into the following ring slots and then off the end of that
+// array. One 1024-byte bulk OUT packet is enough to trigger it.
+//
+// Any real fix belongs here and in DAP_SWD_Transfer()/DAP_SWD_Sequence(): pass the
+// remaining response capacity in, and truncate rather than trusting the count.
+// Deliberately not attempted as part of a documentation pass.
 #if (DAP_SWD != 0)
 static uint32_t DAP_SWD_TransferBlock(const uint8_t *request, uint8_t *response) {
   uint32_t  request_count;
@@ -1767,6 +1788,27 @@ uint32_t DAP_ProcessCommand(const uint8_t *request, uint8_t *response) {
 //   response: pointer to response data
 //   return:   number of bytes in response (lower 16 bits)
 //             number of bytes in request (upper 16 bits)
+//
+// The packed return value is what ../dap_thread_entry.c unpacks into req_bytes /
+// rsp_bytes: the response length goes to R_USB_PipeWrite(), and the larger of the
+// two feeds the status LED's activity blank.
+//
+// NO RESPONSE IN THIS FILE IS BOUNDED AGAINST THE BUFFER IT IS WRITTEN INTO.
+// DAP_PACKET_SIZE appears four times in DAP.c: two compile-time #error range
+// checks, and the two bytes of the DAP_Info reply that *tell* the host what the
+// limit is. There is no runtime check on any command's output length - neither
+// here, where the ID_DAP_ExecuteCommands loop concatenates sub-command responses,
+// nor in the per-command handlers.
+//
+// The whole design rests on the host honouring the size it was told. The largest
+// amplifier is DAP_SWD_TransferBlock() (up to 262,144 bytes from a 5-byte request
+// - see the comment there); DAP_SWD_Transfer() and DAP_SWD_Sequence() can each
+// produce ~2 KB. All three are on the live path.
+//
+// This is upstream ARM code, unmodified here, and the defect is upstream's. It is
+// recorded rather than fixed because a correct fix has to thread a remaining
+// capacity argument through every handler and re-test against real hosts. See
+// ./README.md, "Known limitations carried from upstream".
 uint32_t DAP_ExecuteCommand(const uint8_t *request, uint8_t *response) {
   uint32_t cnt, num, n;
 

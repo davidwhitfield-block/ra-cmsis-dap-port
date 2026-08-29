@@ -1,5 +1,8 @@
 # Host tools
 
+- [`daptest`](#daptest) — functional and performance suite for the probe itself
+- [`rttpull.py`](#rttpullpy) — pull RTT and record SystemView without a J-Link
+
 ## `daptest`
 
 Functional and performance test suite for the probe, driven straight over
@@ -105,3 +108,56 @@ The SWD ceiling is ~3.7 MHz, or ~313 KiB/s: 46 SWD clocks per 32-bit word is the
 ADIv5 floor (8 request + 1 turnaround + 3 ACK + 32 data + 1 parity + 1
 turnaround), and the RA4M2's I/O ports sit on PLBIU at PCLKB, which prices a
 port access at 2-5 PCLKB.
+
+## `rttpull.py`
+
+Pulls SEGGER RTT off a target through any pyOCD-supported probe, and records
+SystemView sessions.
+
+The point is that it does not need a J-Link. SEGGER's RTT Logger and the
+SystemView application both speak to a J-Link and nothing else, so a board wired
+to a CMSIS-DAP probe cannot be traced at all. RTT is a pure memory protocol — a
+control block in target RAM and a pair of ring buffers — so any probe that can
+read memory while the core runs can drain it.
+
+```sh
+pip install pyocd
+./rttpull.py log                                   # channel 0 to stdout
+./rttpull.py sysview --output trace.SVDat          # open this in SystemView
+./rttpull.py --probe 59BF042D36335 log --seconds 10
+```
+
+| Subcommand | What it does |
+|---|---|
+| `log` | Drains a text channel to stdout or a file |
+| `sysview` | Sends START, records the channel to a `.SVDat`, sends STOP |
+| `bench` | Measures how fast this host can drain a channel |
+| `selftest` | Proves the reader is byte-exact, over the real probe |
+
+`selftest` and `bench` need no RTT in the target's firmware: they plant a
+control block in scratch RAM, exercise the real reader against it over the real
+probe, and restore the memory afterwards. `selftest` pushes a known sequence
+through a small ring so the wrapped read path is hit repeatedly, and fails if it
+never wraps — a test that silently stopped covering wraparound would prove much
+less than it claims.
+
+### Why it reads words, not bytes
+
+pyOCD's `read_memory_block8` reads words underneath and then expands them into a
+Python list with one `int` object per byte, which the caller packs back into
+`bytes`. At trace rates that is two O(n) interpreter passes over every byte
+pulled off the target, and it dominates. Going through `array` instead took the
+drain rate from 134 to 241 KiB/s — against `daptest`'s 311.6 KiB/s raw C
+measured on the same target at the same moment, so this is at 77% of what the
+transport itself can do, and comfortably ahead of the ~160 KiB/s a SystemView
+capture produces.
+
+### On macOS
+
+SIP strips `DYLD_*` from the environment when it executes a protected binary, so
+running `pyocd` through the pyenv shim (a `#!/usr/bin/env bash` script) loses
+`DYLD_FALLBACK_LIBRARY_PATH` and libusb is never found — pyOCD then reports
+"STLink, CMSIS-DAPv2 and PicoProbe probes are not supported because no libusb
+library was found" and simply does not list the probe. `rttpull.py` re-execs
+itself once with the variable set, which survives because the interpreter is not
+a protected binary.

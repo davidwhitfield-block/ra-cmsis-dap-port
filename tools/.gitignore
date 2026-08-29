@@ -1,2 +1,3 @@
 daptest
 *.o
+__pycache__/

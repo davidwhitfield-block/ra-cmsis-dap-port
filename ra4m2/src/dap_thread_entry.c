@@ -21,21 +21,31 @@
  * The pulse is what makes it obvious at a glance whether a read, an erase or a
  * flash is really running, rather than the host being wedged.
  *
- * Activity is measured in DAP commands rather than bytes because the two
- * directions are wildly asymmetric: a block READ returns ~1 KiB for a 5-byte
- * request, a block WRITE sends ~1 KiB and returns 4 bytes. Command rate is
- * roughly the same for both, so counting commands makes reads, writes and
- * erases all pulse at a comparable rate. */
-#define STATUS_LED_BLINK_TICKS  pdMS_TO_TICKS(500)  /* not enumerated: half period */
-#define ACTIVITY_LED_COMMANDS   24U                 /* commands per toggle at full rate */
-#define ACTIVITY_LED_MIN_TICKS  pdMS_TO_TICKS(25)   /* toggle ceiling, else it blurs */
-#define ACTIVITY_LED_MAX_TICKS  pdMS_TO_TICKS(120)  /* toggle floor, so light traffic still shows */
-#define ACTIVITY_LED_IDLE_TICKS pdMS_TO_TICKS(200)  /* quiet for this long -> back to solid */
+ * The indication is a *blank*, not a square wave: the LED rests on and is driven
+ * off briefly, because a symmetric toggle fast enough to track a bulk transfer
+ * lands around 12 Hz and the eye integrates that into a slightly dim steady glow
+ * - indistinguishable from idle.
+ *
+ * The blank rate is proportional to DATA VOLUME, one blank per
+ * ACTIVITY_LED_BYTES moved, so the LED tells you how much is flowing and not
+ * merely that something is: ~6 Hz flicker at the ~316 KiB/s ceiling, ~3 Hz at
+ * half rate, ~1 Hz for a trickle. Bounded at both ends - MIN_PERIOD keeps a
+ * saturated transfer from blurring back into a dim glow, MAX_PERIOD keeps a very
+ * slow one (single register pokes from a debugger) visibly alive. */
+#define STATUS_LED_BLINK_TICKS  pdMS_TO_TICKS(500)      /* not enumerated: half period */
+#define ACTIVITY_LED_BYTES      (48U * 1024U)           /* data moved per blank */
+#define ACTIVITY_LED_OFF_TICKS  pdMS_TO_TICKS(45)       /* blank width - long enough to see */
+#define ACTIVITY_LED_MIN_PERIOD pdMS_TO_TICKS(150)      /* fastest cadence (~6.7 Hz) */
+#define ACTIVITY_LED_MAX_PERIOD pdMS_TO_TICKS(1200)     /* slowest cadence (~0.8 Hz) */
+#define ACTIVITY_LED_IDLE_TICKS pdMS_TO_TICKS(300)      /* quiet this long -> back to solid */
 
-/* Bumped once per executed DAP command. Written only by the DAP thread and read
- * only by the DAP thread, so it needs no synchronisation; volatile just keeps
- * the compiler from caching it across the loop. */
-static volatile uint32_t g_dap_activity;
+/* Bytes moved over SWD, accumulated per executed DAP command as the larger of
+ * the command and its response - a block read is 5 bytes in and ~1 KiB out, a
+ * block write the reverse, and it is the big side that was on the wire. Written
+ * and read only by the DAP thread, so it needs no synchronisation; volatile just
+ * keeps the compiler from caching it across the loop. Free to wrap: every
+ * comparison is an unsigned difference. */
+static volatile uint32_t g_dap_bytes;
 
 /* external variables*/
 extern uint8_t g_apl_configuration[];
@@ -70,19 +80,19 @@ static void status_led_update (void)
 
     static bsp_io_level_t last_level    = LED_STATUS_OFF_LEVEL;
     static bool           level_valid   = false;
-    static uint32_t       prev_count    = 0U;   /* for edge detection */
-    static uint32_t       toggle_base   = 0U;   /* command count at last toggle */
-    static TickType_t     last_toggle   = 0U;
+    static uint32_t       seen_bytes    = 0U;   /* byte count at the last blank */
+    static uint32_t       prev_bytes    = 0U;   /* for idle detection */
+    static TickType_t     phase_start   = 0U;   /* when the current on/off phase began */
     static TickType_t     last_activity = 0U;
     static bool           pulse_off     = false;
 
     TickType_t     now   = xTaskGetTickCount();
-    uint32_t       count = g_dap_activity;
+    uint32_t       bytes = g_dap_bytes;
     bsp_io_level_t level;
 
-    if (count != prev_count)
+    if (bytes != prev_bytes)
     {
-        prev_count    = count;
+        prev_bytes    = bytes;
         last_activity = now;
     }
 
@@ -93,26 +103,36 @@ static void status_led_update (void)
     }
     else if ((TickType_t) (now - last_activity) < ACTIVITY_LED_IDLE_TICKS)
     {
-        /* Busy. Toggle once enough commands have gone by, or once enough time
-         * has passed that a low-rate transfer would otherwise look idle - but
-         * never faster than ACTIVITY_LED_MIN_TICKS, which would just look dim. */
-        TickType_t since = (TickType_t) (now - last_toggle);
+        TickType_t since = (TickType_t) (now - phase_start);
 
-        if ((since >= ACTIVITY_LED_MIN_TICKS) &&
-            (((uint32_t) (count - toggle_base) >= ACTIVITY_LED_COMMANDS) ||
-             (since >= ACTIVITY_LED_MAX_TICKS)))
+        if (pulse_off)
         {
-            pulse_off   = !pulse_off;
-            last_toggle = now;
-            toggle_base = count;
+            /* End the blank once it has been off long enough to register. */
+            if (since >= ACTIVITY_LED_OFF_TICKS)
+            {
+                pulse_off   = false;
+                phase_start = now;
+            }
+        }
+        else if ((since >= ACTIVITY_LED_MIN_PERIOD) &&
+                 (((uint32_t) (bytes - seen_bytes) >= ACTIVITY_LED_BYTES) ||
+                  (since >= ACTIVITY_LED_MAX_PERIOD)))
+        {
+            /* Blank once another ACTIVITY_LED_BYTES have gone over the wire, so
+             * the cadence is throughput. The MAX_PERIOD arm is the floor: a host
+             * dribbling single-word transfers still blinks, just slowly. */
+            seen_bytes  = bytes;
+            pulse_off   = true;
+            phase_start = now;
         }
 
         level = pulse_off ? LED_STATUS_OFF_LEVEL : LED_STATUS_ON_LEVEL;
     }
     else
     {
+        seen_bytes  = bytes;
         pulse_off   = false;
-        toggle_base = count;
+        phase_start = now;
         level       = LED_STATUS_ON_LEVEL;
     }
 
@@ -418,13 +438,27 @@ void dap_thread_entry(void *pvParameters)
                 }
 
                 // Execute DAP Command (process request and prepare response)
-                USB_RespSize[USB_ResponseIndexI] =
-                    (uint16_t)DAP_ExecuteCommand(USB_Request[USB_RequestIndexO], USB_Response[USB_ResponseIndexI]);
+                /* DAP_ExecuteCommand packs request bytes consumed in the upper
+                 * half and response bytes produced in the lower half. */
+                uint32_t executed =
+                    DAP_ExecuteCommand(USB_Request[USB_RequestIndexO], USB_Response[USB_ResponseIndexI]);
+                uint32_t req_bytes = executed >> 16;
+                uint32_t rsp_bytes = executed & 0xFFFFU;
 
-                /* Feeds the activity pulse on the status LED. One increment per
-                 * command is negligible next to the SWD traffic the command
-                 * just did, so this stays off the critical path. */
-                g_dap_activity++;
+                USB_RespSize[USB_ResponseIndexI] = (uint16_t) rsp_bytes;
+
+                /* Feeds the activity blank on the status LED. The larger half is
+                 * the payload that was actually on the wire: a block read is
+                 * 5 bytes in / ~1 KiB out, a block write the reverse. An add and
+                 * a compare are nothing next to the SWD traffic just done. */
+                g_dap_bytes += (req_bytes > rsp_bytes) ? req_bytes : rsp_bytes;
+
+                /* Drive the LED from inside the command loop as well. Under a
+                 * saturated transfer this loop can run for many milliseconds
+                 * without the outer event loop turning over, and the blank
+                 * timing has to stay honest regardless. It costs one tick read
+                 * and a compare unless the level actually changes. */
+                status_led_update();
 
                 // Update Request Index and Count
                 USB_RequestIndexO++;
